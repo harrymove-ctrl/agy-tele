@@ -1,0 +1,25 @@
+{
+  "name": "agy-tele",
+  "version": "0.1.0",
+  "description": "Two-way Telegram and Antigravity Desktop sync daemon built on local agentapi, SQLite FTS5, incremental transcript tailing, and anti-slop English prompt composition.",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "bin": {
+    "agy-tele": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/cli.ts start",
+    "doctor": "bun run src/cli.ts doctor",
+    "threads": "bun run src/cli.ts threads",
+    "compose": "bun run src/cli.ts compose",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "install:launchd": "bun run src/cli.ts install-launchd",
+    "uninstall:launchd": "bun run src/cli.ts uninstall-launchd"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.2",
+    "typescript": "^5.8.3"
+  }
+}
