@@ -8,6 +8,8 @@ export type AppConfig = {
   defaultChatId: string | null;
   agyDataDir: string;
   agyBrainDir: string;
+  agyProjectsDir: string;
+  defaultFolder: string | null;
   agentApiBin: string;
   defaultWorkspace: string;
   defaultModel: string | null;
@@ -56,6 +58,12 @@ export function loadConfig(
     ? expandHomePath(env.AGY_DATA_DIR.trim())
     : path.join(home, ".gemini", "antigravity");
 
+  const agyProjectsDir = env.AGY_PROJECTS_DIR?.trim()
+    ? expandHomePath(env.AGY_PROJECTS_DIR.trim())
+    : path.join(home, ".gemini", "config", "projects");
+
+  const defaultFolder = env.AGY_DEFAULT_FOLDER?.trim() || null;
+
   const agentApiBin = env.AGY_AGENTAPI_BIN?.trim()
     ? expandHomePath(env.AGY_AGENTAPI_BIN.trim())
     : path.join(agyDataDir, "bin", "agentapi");
@@ -91,6 +99,8 @@ export function loadConfig(
     defaultChatId: env.TELEGRAM_CHAT_ID?.trim() || null,
     agyDataDir,
     agyBrainDir: path.join(agyDataDir, "brain"),
+    agyProjectsDir,
+    defaultFolder,
     agentApiBin,
     defaultWorkspace,
     defaultModel: env.AGY_DEFAULT_MODEL?.trim() || null,

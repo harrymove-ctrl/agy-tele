@@ -17,6 +17,7 @@
   "scripts": {
     "start": "bun run src/cli.ts start",
     "doctor": "bun run src/cli.ts doctor",
+    "folders": "bun run src/cli.ts folders",
     "threads": "bun run src/cli.ts threads",
     "compose": "bun run src/cli.ts compose",
     "test": "bun test",

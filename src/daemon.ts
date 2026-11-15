@@ -4,12 +4,15 @@ import {
   chunkTelegramText,
   getConversationMetadata,
   listConversations,
+  listSessionFolders,
   readRecentTranscriptEvents,
   readTranscriptDelta,
   resolveConversationByPrefix,
+  resolveSessionFolder,
   sendMessageToDesktop,
   startDesktopConversation,
   type ConversationSummary,
+  type SessionFolder,
   type TranscriptDeltaResult,
   type TranscriptEvent,
 } from "./antigravity.ts";
@@ -39,13 +42,29 @@ import type {
 } from "./telegram.ts";
 
 export interface DesktopBridge {
+  listSessionFolders(
+    dataDir: string,
+    options?: { projectsDir?: string }
+  ): SessionFolder[];
+  resolveSessionFolder(
+    dataDir: string,
+    nameOrIdOrPrefix: string,
+    options?: { projectsDir?: string }
+  ): SessionFolder | null;
   listConversations(
     dataDir: string,
-    options?: { limit?: number; query?: string }
+    options?: {
+      limit?: number;
+      query?: string;
+      folderId?: string | null;
+      projectsDir?: string;
+      includeArchived?: boolean;
+    }
   ): ConversationSummary[];
   resolveConversationByPrefix(
     dataDir: string,
-    idOrPrefix: string
+    idOrPrefix: string,
+    options?: { folderId?: string | null; projectsDir?: string }
   ): ConversationSummary | null;
   getConversationMetadata(
     agentApiBin: string,
@@ -55,7 +74,8 @@ export interface DesktopBridge {
     agentApiBin: string,
     conversationId: string,
     content: string,
-    title?: string
+    title?: string,
+    projectId?: string | null
   ): Promise<void>;
   startDesktopConversation(
     agentApiBin: string,
@@ -64,6 +84,7 @@ export interface DesktopBridge {
       title?: string;
       model?: string | null;
       cwd?: string;
+      projectId?: string | null;
     }
   ): Promise<string>;
   readTranscriptDelta(
@@ -84,6 +105,8 @@ export interface DesktopBridge {
 }
 
 const DEFAULT_BRIDGE: DesktopBridge = {
+  listSessionFolders,
+  resolveSessionFolder,
   listConversations,
   resolveConversationByPrefix,
   getConversationMetadata,
@@ -96,6 +119,8 @@ const DEFAULT_BRIDGE: DesktopBridge = {
 };
 
 export const BOT_COMMANDS: BotCommandSpec[] = [
+  { command: "folders", description: "List Antigravity Desktop Session Folders" },
+  { command: "folder", description: "Sync Telegram chat to a Session Folder" },
   { command: "threads", description: "List or search Desktop conversations" },
   { command: "bind", description: "Bind chat or topic to conversation ID" },
   { command: "new", description: "Start a new Antigravity conversation" },
@@ -104,7 +129,7 @@ export const BOT_COMMANDS: BotCommandSpec[] = [
   { command: "mode", description: "Set composer mode: auto, always, off" },
   { command: "tail", description: "Show recent Desktop conversation turns" },
   { command: "shot", description: "Send a local screenshot file to Telegram" },
-  { command: "status", description: "Show bound Desktop thread and daemon state" },
+  { command: "status", description: "Show synced folder, thread, and daemon state" },
 ];
 
 const ALLOWED_SHOT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
@@ -118,10 +143,25 @@ function parseCommand(raw: string): { command: string; arg: string } | null {
   };
 }
 
+function formatFolderLine(folder: SessionFolder, idx: number): string {
+  const shortId = folder.id.slice(0, 8);
+  const wsLabel = folder.primaryWorkspace
+    ? path.basename(folder.primaryWorkspace) || folder.primaryWorkspace
+    : "workspace";
+  return `${idx + 1}. ${folder.name} [${shortId}] (${folder.activeThreadCount} active, ${wsLabel})`;
+}
+
 function formatThreadLine(item: ConversationSummary, idx: number): string {
   const shortId = item.conversationId.slice(0, 8);
   const stateLabel = item.status.includes("RUNNING") ? "running" : "idle";
-  return `${idx + 1}. [${shortId}] ${item.title} (${item.primaryWorkspace}, ${stateLabel}, ${item.stepCount} steps)`;
+  const folderTag = item.folderName ? ` [${item.folderName}]` : "";
+  return `${idx + 1}. [${shortId}]${folderTag} ${item.title} (${item.primaryWorkspace}, ${stateLabel}, ${item.stepCount} steps)`;
+}
+
+function parseTimestampMs(raw: string | undefined): number {
+  if (!raw) return 0;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function formatTranscriptEvent(event: TranscriptEvent): string {
@@ -191,11 +231,27 @@ export class AgyTeleDaemon {
       conversationId: string;
       title: string;
       workspace: string;
+      folderId?: string | null;
+      folderName?: string | null;
     },
     skipExisting = true
   ): ThreadBinding {
     const key = makeChatKey(chatId, messageThreadId);
     const existing = this.state.bindings[key];
+    const resolvedFolderId =
+      conversation.folderId !== undefined
+        ? conversation.folderId ?? undefined
+        : existing?.folderId;
+    const resolvedFolderName =
+      conversation.folderName !== undefined
+        ? conversation.folderName ?? undefined
+        : existing?.folderName;
+    const keepWatchFolder = Boolean(
+      existing?.watchFolder &&
+        resolvedFolderId &&
+        existing.folderId === resolvedFolderId
+    );
+
     const binding: ThreadBinding = {
       chatKey: key,
       chatId,
@@ -203,12 +259,19 @@ export class AgyTeleDaemon {
       conversationId: conversation.conversationId,
       title: conversation.title,
       workspace: conversation.workspace,
+      folderId: resolvedFolderId,
+      folderName: resolvedFolderName,
+      watchFolder: keepWatchFolder || undefined,
+      folderSyncedAt: keepWatchFolder ? existing?.folderSyncedAt : undefined,
       flowGenEn: existing?.flowGenEn ?? this.config.flowGenEn,
       updatedAt: new Date().toISOString(),
     };
     this.state.bindings[key] = binding;
 
-    if (!this.state.cursors[conversation.conversationId]) {
+    if (
+      conversation.conversationId &&
+      !this.state.cursors[conversation.conversationId]
+    ) {
       this.state.cursors[conversation.conversationId] = skipExisting
         ? this.bridge.initCursorAtEof(
             this.config.agyBrainDir,
@@ -222,10 +285,118 @@ export class AgyTeleDaemon {
     return binding;
   }
 
+  private syncChatToFolder(
+    chatId: number,
+    messageThreadId: number | undefined,
+    folder: SessionFolder,
+    skipExisting = true
+  ): { binding: ThreadBinding; threads: ConversationSummary[] } {
+    const key = makeChatKey(chatId, messageThreadId);
+    const existing = this.state.bindings[key];
+    const threads = this.bridge.listConversations(this.config.agyDataDir, {
+      limit: 25,
+      folderId: folder.id,
+      projectsDir: this.config.agyProjectsDir,
+    });
+
+    for (const item of threads) {
+      if (!this.state.cursors[item.conversationId]) {
+        this.state.cursors[item.conversationId] = skipExisting
+          ? this.bridge.initCursorAtEof(
+              this.config.agyBrainDir,
+              item.conversationId
+            )
+          : { byteOffset: 0, lastStepIndex: -1 };
+      }
+    }
+
+    const chosen =
+      threads.find((item) => existing?.conversationId === item.conversationId) ??
+      threads[0];
+    const workspace =
+      chosen?.workspaces[0] ??
+      (folder.primaryWorkspace || existing?.workspace || this.config.defaultWorkspace);
+    const folderSyncedAt =
+      existing?.folderId === folder.id && existing.folderSyncedAt
+        ? existing.folderSyncedAt
+        : new Date().toISOString();
+
+    const binding: ThreadBinding = {
+      chatKey: key,
+      chatId,
+      messageThreadId,
+      conversationId: chosen?.conversationId ?? "",
+      title: chosen?.title ?? `Folder: ${folder.name}`,
+      workspace,
+      folderId: folder.id,
+      folderName: folder.name,
+      watchFolder: true,
+      folderSyncedAt,
+      flowGenEn: existing?.flowGenEn ?? this.config.flowGenEn,
+      updatedAt: new Date().toISOString(),
+    };
+    this.state.bindings[key] = binding;
+    this.persist();
+    this.refreshLogWatchers();
+    return { binding, threads };
+  }
+
+  private ensureDefaultFolderBinding(
+    chatId: number,
+    messageThreadId: number | undefined,
+    key: string
+  ): ThreadBinding | undefined {
+    const existing = this.state.bindings[key];
+    if (existing) return existing;
+    if (!this.config.defaultFolder) return undefined;
+
+    try {
+      const folder = this.bridge.resolveSessionFolder(
+        this.config.agyDataDir,
+        this.config.defaultFolder,
+        { projectsDir: this.config.agyProjectsDir }
+      );
+      if (!folder) return undefined;
+      return this.syncChatToFolder(chatId, messageThreadId, folder, true).binding;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private collectWatchedConversationIds(): Set<string> {
+    const activeIds = new Set<string>();
+    const checkedFolders = new Set<string>();
+
+    for (const binding of Object.values(this.state.bindings)) {
+      if (binding.conversationId) {
+        activeIds.add(binding.conversationId);
+      }
+      if (
+        binding.watchFolder &&
+        binding.folderId &&
+        !checkedFolders.has(binding.folderId)
+      ) {
+        checkedFolders.add(binding.folderId);
+        try {
+          const threads = this.bridge.listConversations(this.config.agyDataDir, {
+            limit: 25,
+            folderId: binding.folderId,
+            projectsDir: this.config.agyProjectsDir,
+          });
+          for (const item of threads) {
+            activeIds.add(item.conversationId);
+          }
+        } catch {
+          // Database may not exist in isolated unit tests; keep explicit bindings active.
+        }
+      }
+    }
+
+    return activeIds;
+  }
+
   private refreshLogWatchers(): void {
-    const activeIds = new Set(
-      Object.values(this.state.bindings).map((b) => b.conversationId)
-    );
+    const activeIds = this.collectWatchedConversationIds();
 
     for (const [cid, watcher] of this.watchers.entries()) {
       if (!activeIds.has(cid)) {
@@ -282,14 +453,16 @@ export class AgyTeleDaemon {
   private async sendChunked(
     chatId: number,
     text: string,
-    messageThreadId?: number
+    messageThreadId?: number,
+    replyMarkup?: { inline_keyboard: InlineKeyboardButton[][] }
   ): Promise<void> {
     const chunks = chunkTelegramText(text);
-    for (const chunk of chunks) {
+    for (let i = 0; i < chunks.length; i++) {
       await this.telegram.sendMessage({
         chatId,
-        text: chunk,
+        text: chunks[i],
         messageThreadId,
+        replyMarkup: i === chunks.length - 1 ? replyMarkup : undefined,
       });
     }
   }
@@ -328,11 +501,41 @@ export class AgyTeleDaemon {
       return;
     }
 
+    if (data.startsWith("folder:")) {
+      const folderId = data.slice("folder:".length);
+      const folder = this.bridge.resolveSessionFolder(
+        this.config.agyDataDir,
+        folderId,
+        { projectsDir: this.config.agyProjectsDir }
+      );
+      if (!folder) {
+        await this.telegram.answerCallbackQuery(query.id, "Folder not found");
+        return;
+      }
+      const { binding, threads } = this.syncChatToFolder(
+        msg.chat.id,
+        msg.message_thread_id,
+        folder,
+        true
+      );
+      await this.telegram.answerCallbackQuery(query.id, `Synced ${folder.name}`);
+      const activeLine = binding.conversationId
+        ? `Active reply target: [${binding.conversationId.slice(0, 8)}] ${binding.title}`
+        : "No active threads in this folder yet; send a message or /new <prompt> to start one.";
+      await this.telegram.sendMessage({
+        chatId: msg.chat.id,
+        messageThreadId: msg.message_thread_id,
+        text: `Synced folder "${folder.name}" (${threads.length} active thread(s)).\n${activeLine}`,
+      });
+      return;
+    }
+
     if (data.startsWith("bind:")) {
       const cid = data.slice("bind:".length);
       const summary = this.bridge.resolveConversationByPrefix(
         this.config.agyDataDir,
-        cid
+        cid,
+        { projectsDir: this.config.agyProjectsDir }
       );
       if (!summary) {
         await this.telegram.answerCallbackQuery(query.id, "Thread not found");
@@ -345,6 +548,8 @@ export class AgyTeleDaemon {
           conversationId: summary.conversationId,
           title: summary.title,
           workspace: summary.workspaces[0] ?? this.config.defaultWorkspace,
+          folderId: summary.projectId,
+          folderName: summary.folderName,
         },
         true
       );
@@ -364,7 +569,7 @@ export class AgyTeleDaemon {
       const key = makeChatKey(msg.chat.id, msg.message_thread_id);
       const binding = this.state.bindings[key];
 
-      if (!answer || !binding) {
+      if (!answer || !binding || !binding.conversationId) {
         await this.telegram.answerCallbackQuery(
           query.id,
           "Option expired or chat unbound"
@@ -376,7 +581,8 @@ export class AgyTeleDaemon {
         this.config.agentApiBin,
         binding.conversationId,
         answer,
-        binding.title
+        binding.title,
+        binding.folderId
       );
       await this.telegram.answerCallbackQuery(query.id, `Sent: ${answer}`);
       await this.telegram.sendMessage({
@@ -419,35 +625,189 @@ export class AgyTeleDaemon {
     arg: string
   ): Promise<void> {
     if (command === "start" || command === "help") {
-      const binding = this.state.bindings[key];
-      const statusLine = binding
-        ? `Bound: [${binding.conversationId.slice(0, 8)}] ${binding.title} (mode: ${binding.flowGenEn})`
-        : "Not bound yet. Send /threads to pick an active Desktop thread or /new <prompt>.";
+      const binding = this.ensureDefaultFolderBinding(chatId, threadId, key);
+      const statusParts: string[] = [];
+      if (binding?.folderName) {
+        statusParts.push(`Folder: ${binding.folderName}`);
+      }
+      if (binding?.conversationId) {
+        statusParts.push(
+          `Thread: [${binding.conversationId.slice(0, 8)}] ${binding.title} (mode: ${binding.flowGenEn})`
+        );
+      }
+      const statusLine =
+        statusParts.length > 0
+          ? statusParts.join(" | ")
+          : "Not synced yet. Send /folders to sync a Session Folder, /threads to pick a thread, or /new <prompt>.";
       await this.telegram.sendMessage({
         chatId,
         messageThreadId: threadId,
         text: [
           "agy-tele two-way Antigravity Desktop sync",
           statusLine,
-          "Commands: /threads [query], /bind <id>, /new [dir ::] <prompt>, /en <draft>, /raw <text>, /mode [auto|always|off], /tail [n], /shot <path>, /status",
+          "Commands: /folders, /folder [name|off], /threads [all] [query], /bind <id>, /new [dir ::] <prompt>, /en <draft>, /raw <text>, /mode [auto|always|off], /tail [n], /shot <path>, /status",
         ].join("\n\n"),
       });
       return;
     }
 
-    if (command === "threads") {
-      const items = this.bridge.listConversations(this.config.agyDataDir, {
-        limit: 8,
-        query: arg,
+    if (command === "folders") {
+      const folders = this.bridge.listSessionFolders(this.config.agyDataDir, {
+        projectsDir: this.config.agyProjectsDir,
       });
-      if (items.length === 0) {
+      if (folders.length === 0) {
         await this.telegram.sendMessage({
           chatId,
           messageThreadId: threadId,
-          text: arg ? `No Desktop threads matched "${arg}".` : "No Desktop threads found.",
+          text: `No Antigravity Session Folders found in ${this.config.agyProjectsDir}.`,
         });
         return;
       }
+      const lines = folders.map(formatFolderLine);
+      const keyboard: InlineKeyboardButton[][] = [];
+      for (let i = 0; i < folders.length; i += 2) {
+        const row: InlineKeyboardButton[] = [];
+        for (const folder of folders.slice(i, i + 2)) {
+          row.push({
+            text: `Sync ${folder.name.slice(0, 22)}`,
+            callback_data: `folder:${folder.id}`,
+          });
+        }
+        keyboard.push(row);
+      }
+      await this.telegram.sendMessage({
+        chatId,
+        messageThreadId: threadId,
+        text: lines.join("\n"),
+        replyMarkup: { inline_keyboard: keyboard },
+      });
+      return;
+    }
+
+    if (command === "folder") {
+      const existing = this.ensureDefaultFolderBinding(chatId, threadId, key);
+      if (!arg) {
+        if (existing?.folderName) {
+          const activeLabel = existing.conversationId
+            ? `[${existing.conversationId.slice(0, 8)}] ${existing.title}`
+            : "none yet";
+          await this.telegram.sendMessage({
+            chatId,
+            messageThreadId: threadId,
+            text: [
+              `Synced folder: ${existing.folderName} [${existing.folderId?.slice(0, 8) ?? ""}]`,
+              `Watch all folder threads: ${existing.watchFolder ? "on" : "off"}`,
+              `Active reply target: ${activeLabel}`,
+              "Use /folder <name>, /folder off, or /folders.",
+            ].join("\n"),
+          });
+        } else {
+          await this.telegram.sendMessage({
+            chatId,
+            messageThreadId: threadId,
+            text: "No Session Folder synced for this chat. Send /folders to choose one (for example: /folder my-working-daily).",
+          });
+        }
+        return;
+      }
+
+      if (arg.toLowerCase() === "off") {
+        if (!existing?.folderId) {
+          await this.telegram.sendMessage({
+            chatId,
+            messageThreadId: threadId,
+            text: "No Session Folder sync is active for this chat.",
+          });
+          return;
+        }
+        if (!existing.conversationId) {
+          delete this.state.bindings[key];
+          this.persist();
+          this.refreshLogWatchers();
+          await this.telegram.sendMessage({
+            chatId,
+            messageThreadId: threadId,
+            text: "Stopped Session Folder sync for this chat.",
+          });
+          return;
+        }
+        existing.folderId = undefined;
+        existing.folderName = undefined;
+        existing.watchFolder = undefined;
+        existing.folderSyncedAt = undefined;
+        existing.updatedAt = new Date().toISOString();
+        this.persist();
+        this.refreshLogWatchers();
+        await this.telegram.sendMessage({
+          chatId,
+          messageThreadId: threadId,
+          text: `Detached Session Folder watch while keeping [${existing.conversationId.slice(0, 8)}] ${existing.title} bound.`,
+        });
+        return;
+      }
+
+      const folder = this.bridge.resolveSessionFolder(
+        this.config.agyDataDir,
+        arg,
+        { projectsDir: this.config.agyProjectsDir }
+      );
+      if (!folder) {
+        await this.telegram.sendMessage({
+          chatId,
+          messageThreadId: threadId,
+          text: `Session Folder "${arg}" not found. Send /folders to list available folders.`,
+        });
+        return;
+      }
+
+      const { binding, threads } = this.syncChatToFolder(
+        chatId,
+        threadId,
+        folder,
+        true
+      );
+      const activeLine = binding.conversationId
+        ? `Active reply target: [${binding.conversationId.slice(0, 8)}] ${binding.title}`
+        : "No active threads in this folder yet; send a message or /new <prompt> to start one.";
+      await this.telegram.sendMessage({
+        chatId,
+        messageThreadId: threadId,
+        text: `Synced folder "${folder.name}" (${threads.length} active thread(s)).\n${activeLine}`,
+      });
+      return;
+    }
+
+    if (command === "threads") {
+      const binding = this.ensureDefaultFolderBinding(chatId, threadId, key);
+      const lowerArg = arg.toLowerCase();
+      const includeAll = lowerArg === "all" || lowerArg.startsWith("all ");
+      const query = includeAll ? arg.slice(3).trim() : arg;
+      const folderId = includeAll ? undefined : binding?.folderId;
+
+      const items = this.bridge.listConversations(this.config.agyDataDir, {
+        limit: 8,
+        query,
+        folderId,
+        projectsDir: this.config.agyProjectsDir,
+      });
+      if (items.length === 0) {
+        const scopeLabel =
+          !includeAll && binding?.folderName
+            ? ` in folder "${binding.folderName}"`
+            : "";
+        await this.telegram.sendMessage({
+          chatId,
+          messageThreadId: threadId,
+          text: query
+            ? `No Desktop threads matched "${query}"${scopeLabel}.`
+            : `No Desktop threads found${scopeLabel}.`,
+        });
+        return;
+      }
+      const header =
+        !includeAll && binding?.folderName
+          ? `Folder: ${binding.folderName} (send "/threads all" for all folders)\n`
+          : "";
       const lines = items.map(formatThreadLine);
       const keyboard: InlineKeyboardButton[][] = [];
       for (let i = 0; i < items.length; i += 2) {
@@ -463,7 +823,7 @@ export class AgyTeleDaemon {
       await this.telegram.sendMessage({
         chatId,
         messageThreadId: threadId,
-        text: lines.join("\n"),
+        text: `${header}${lines.join("\n")}`,
         replyMarkup: { inline_keyboard: keyboard },
       });
       return;
@@ -478,9 +838,14 @@ export class AgyTeleDaemon {
         });
         return;
       }
+      const existing = this.state.bindings[key];
       const summary = this.bridge.resolveConversationByPrefix(
         this.config.agyDataDir,
-        arg
+        arg,
+        {
+          folderId: existing?.folderId,
+          projectsDir: this.config.agyProjectsDir,
+        }
       );
       if (!summary) {
         await this.telegram.sendMessage({
@@ -497,13 +862,16 @@ export class AgyTeleDaemon {
           conversationId: summary.conversationId,
           title: summary.title,
           workspace: summary.workspaces[0] ?? this.config.defaultWorkspace,
+          folderId: summary.projectId,
+          folderName: summary.folderName,
         },
         true
       );
+      const folderSuffix = binding.folderName ? ` [${binding.folderName}]` : "";
       await this.telegram.sendMessage({
         chatId,
         messageThreadId: threadId,
-        text: `Bound to [${binding.conversationId.slice(0, 8)}] ${binding.title} (${path.basename(binding.workspace)}).`,
+        text: `Bound to [${binding.conversationId.slice(0, 8)}] ${binding.title}${folderSuffix} (${path.basename(binding.workspace)}).`,
       });
       return;
     }
@@ -517,7 +885,8 @@ export class AgyTeleDaemon {
         });
         return;
       }
-      let workspace = this.config.defaultWorkspace;
+      const existingBinding = this.ensureDefaultFolderBinding(chatId, threadId, key);
+      let workspace = existingBinding?.workspace || this.config.defaultWorkspace;
       let rawPrompt = arg;
       const splitIdx = arg.indexOf("::");
       if (splitIdx > 0) {
@@ -529,7 +898,7 @@ export class AgyTeleDaemon {
         }
       }
 
-      const mode = this.state.bindings[key]?.flowGenEn ?? this.config.flowGenEn;
+      const mode = existingBinding?.flowGenEn ?? this.config.flowGenEn;
       const composed = await this.bridge.composeEnglishPrompt(rawPrompt, { mode });
       if (composed.changed) {
         await this.telegram.sendMessage({
@@ -547,18 +916,28 @@ export class AgyTeleDaemon {
           title,
           model: this.config.defaultModel,
           cwd: workspace,
+          projectId: existingBinding?.folderId ?? null,
         }
       );
       const binding = this.bindChat(
         chatId,
         threadId,
-        { conversationId: cid, title, workspace },
+        {
+          conversationId: cid,
+          title,
+          workspace,
+          folderId: existingBinding?.folderId ?? null,
+          folderName: existingBinding?.folderName ?? null,
+        },
         false
       );
+      const folderNote = binding.folderName
+        ? ` inside folder "${binding.folderName}"`
+        : "";
       await this.telegram.sendMessage({
         chatId,
         messageThreadId: threadId,
-        text: `Started [${binding.conversationId.slice(0, 8)}] in ${path.basename(workspace)}.`,
+        text: `Started [${binding.conversationId.slice(0, 8)}]${folderNote} in ${path.basename(workspace)}.`,
       });
       return;
     }
@@ -640,11 +1019,11 @@ export class AgyTeleDaemon {
 
     if (command === "tail") {
       const binding = this.state.bindings[key];
-      if (!binding) {
+      if (!binding || !binding.conversationId) {
         await this.telegram.sendMessage({
           chatId,
           messageThreadId: threadId,
-          text: "This chat is not bound yet. Run /threads or /bind first.",
+          text: "No active Desktop thread yet. Run /threads, /folder <name>, or /new <prompt> first.",
         });
         return;
       }
@@ -702,36 +1081,50 @@ export class AgyTeleDaemon {
     }
 
     if (command === "status") {
-      const binding = this.state.bindings[key];
+      const binding = this.ensureDefaultFolderBinding(chatId, threadId, key);
       if (!binding) {
         await this.telegram.sendMessage({
           chatId,
           messageThreadId: threadId,
-          text: `Unbound chat. Default workspace: ${this.config.defaultWorkspace}, Flow-Gen-EN: ${this.config.flowGenEn}.`,
+          text: `Unbound chat. Default workspace: ${this.config.defaultWorkspace}, Default folder: ${this.config.defaultFolder ?? "none"}, Flow-Gen-EN: ${this.config.flowGenEn}.`,
         });
         return;
       }
-      const cursor = this.state.cursors[binding.conversationId];
-      let liveStatus = "unreachable";
-      try {
-        await this.bridge.getConversationMetadata(
-          this.config.agentApiBin,
-          binding.conversationId
+      const lines: string[] = [];
+      if (binding.folderName) {
+        lines.push(
+          `Folder: ${binding.folderName} [${binding.folderId?.slice(0, 8) ?? ""}] (watch: ${binding.watchFolder ? "on" : "off"})`
         );
-        liveStatus = "connected";
-      } catch (err) {
-        liveStatus = err instanceof Error ? err.message : String(err);
+      }
+      if (!binding.conversationId) {
+        lines.push("Thread: (none active yet in folder)");
+        lines.push(`Workspace: ${binding.workspace}`);
+        lines.push(`Flow-Gen-EN: ${binding.flowGenEn}`);
+        lines.push("agentapi: idle (send a message or /new <prompt>)");
+      } else {
+        const cursor = this.state.cursors[binding.conversationId];
+        let liveStatus = "unreachable";
+        try {
+          await this.bridge.getConversationMetadata(
+            this.config.agentApiBin,
+            binding.conversationId
+          );
+          liveStatus = "connected";
+        } catch (err) {
+          liveStatus = err instanceof Error ? err.message : String(err);
+        }
+        lines.push(`Thread: ${binding.title} [${binding.conversationId}]`);
+        lines.push(`Workspace: ${binding.workspace}`);
+        lines.push(`Flow-Gen-EN: ${binding.flowGenEn}`);
+        lines.push(
+          `Cursor: step ${cursor?.lastStepIndex ?? -1} (${cursor?.byteOffset ?? 0} bytes)`
+        );
+        lines.push(`agentapi: ${liveStatus}`);
       }
       await this.telegram.sendMessage({
         chatId,
         messageThreadId: threadId,
-        text: [
-          `Thread: ${binding.title} [${binding.conversationId}]`,
-          `Workspace: ${binding.workspace}`,
-          `Flow-Gen-EN: ${binding.flowGenEn}`,
-          `Cursor: step ${cursor?.lastStepIndex ?? -1} (${cursor?.byteOffset ?? 0} bytes)`,
-          `agentapi: ${liveStatus}`,
-        ].join("\n"),
+        text: lines.join("\n"),
       });
       return;
     }
@@ -750,7 +1143,9 @@ export class AgyTeleDaemon {
     rawText: string,
     bypassComposer: boolean
   ): Promise<void> {
-    const existing = this.state.bindings[key];
+    const existing =
+      this.ensureDefaultFolderBinding(chatId, threadId, key) ??
+      this.state.bindings[key];
     const mode: ComposeMode = bypassComposer
       ? "off"
       : existing?.flowGenEn ?? this.config.flowGenEn;
@@ -764,17 +1159,19 @@ export class AgyTeleDaemon {
       });
     }
 
-    if (existing) {
+    if (existing && existing.conversationId) {
       await this.bridge.sendMessageToDesktop(
         this.config.agentApiBin,
         existing.conversationId,
         composed.text,
-        existing.title
+        existing.title,
+        existing.folderId
       );
       this.wakeTranscriptLoop();
       return;
     }
 
+    const targetWorkspace = existing?.workspace || this.config.defaultWorkspace;
     const title = composed.text.slice(0, 56);
     const cid = await this.bridge.startDesktopConversation(
       this.config.agentApiBin,
@@ -782,7 +1179,8 @@ export class AgyTeleDaemon {
         prompt: composed.text,
         title,
         model: this.config.defaultModel,
-        cwd: this.config.defaultWorkspace,
+        cwd: targetWorkspace,
+        projectId: existing?.folderId ?? null,
       }
     );
     const binding = this.bindChat(
@@ -791,31 +1189,103 @@ export class AgyTeleDaemon {
       {
         conversationId: cid,
         title,
-        workspace: this.config.defaultWorkspace,
+        workspace: targetWorkspace,
+        folderId: existing?.folderId ?? null,
+        folderName: existing?.folderName ?? null,
       },
       false
     );
+    const folderNote = binding.folderName
+      ? ` inside folder "${binding.folderName}"`
+      : "";
     await this.telegram.sendMessage({
       chatId,
       messageThreadId: threadId,
-      text: `Started [${binding.conversationId.slice(0, 8)}] in ${path.basename(binding.workspace)}.`,
+      text: `Started [${binding.conversationId.slice(0, 8)}]${folderNote} in ${path.basename(binding.workspace)}.`,
     });
   }
 
   /**
-   * Poll all bound Desktop transcripts once and push new turns to Telegram.
+   * Poll all bound Desktop threads and watched Session Folder threads once.
    */
   async syncTranscriptsOnce(): Promise<number> {
-    const bindingsByCid = new Map<string, ThreadBinding[]>();
+    type DeliveryTarget = {
+      binding: ThreadBinding;
+      isSibling: boolean;
+      threadTitle: string;
+      folderName?: string;
+    };
+
+    const targetsByCid = new Map<string, DeliveryTarget[]>();
+    const folderThreadsCache = new Map<string, ConversationSummary[]>();
+    let discoveredNewSibling = false;
+
+    const addTarget = (cid: string, target: DeliveryTarget) => {
+      const list = targetsByCid.get(cid) ?? [];
+      list.push(target);
+      targetsByCid.set(cid, list);
+    };
+
     for (const binding of Object.values(this.state.bindings)) {
-      const list = bindingsByCid.get(binding.conversationId) ?? [];
-      list.push(binding);
-      bindingsByCid.set(binding.conversationId, list);
+      if (binding.conversationId) {
+        addTarget(binding.conversationId, {
+          binding,
+          isSibling: false,
+          threadTitle: binding.title,
+          folderName: binding.folderName,
+        });
+      }
+
+      if (binding.watchFolder && binding.folderId) {
+        let folderThreads = folderThreadsCache.get(binding.folderId);
+        if (!folderThreads) {
+          try {
+            folderThreads = this.bridge.listConversations(this.config.agyDataDir, {
+              limit: 25,
+              folderId: binding.folderId,
+              projectsDir: this.config.agyProjectsDir,
+            });
+          } catch {
+            folderThreads = [];
+          }
+          folderThreadsCache.set(binding.folderId, folderThreads);
+        }
+
+        const syncedMs = parseTimestampMs(binding.folderSyncedAt);
+        for (const item of folderThreads) {
+          if (item.conversationId === binding.conversationId) continue;
+
+          if (!this.state.cursors[item.conversationId]) {
+            const itemMs = parseTimestampMs(item.lastModifiedTime);
+            const isNewSinceSync =
+              !syncedMs || (itemMs > 0 && itemMs >= syncedMs - 5000);
+            this.state.cursors[item.conversationId] = isNewSinceSync
+              ? { byteOffset: 0, lastStepIndex: -1 }
+              : this.bridge.initCursorAtEof(
+                  this.config.agyBrainDir,
+                  item.conversationId
+                );
+            discoveredNewSibling = true;
+          }
+
+          addTarget(item.conversationId, {
+            binding,
+            isSibling: true,
+            threadTitle: item.title,
+            folderName: binding.folderName ?? item.folderName ?? undefined,
+          });
+        }
+      }
+    }
+
+    if (discoveredNewSibling) {
+      this.persist();
+      this.refreshLogWatchers();
     }
 
     let delivered = 0;
 
-    for (const [cid, bindings] of bindingsByCid.entries()) {
+    for (const [cid, targets] of targetsByCid.entries()) {
       const currentCursor = this.state.cursors[cid] ?? {
         byteOffset: 0,
         lastStepIndex: -1,
@@ -837,38 +1307,60 @@ export class AgyTeleDaemon {
 
       for (const event of delta.events) {
         const rendered = formatTranscriptEvent(event);
-        for (const binding of bindings) {
+        for (const target of targets) {
+          const { binding, isSibling, threadTitle, folderName } = target;
+          const siblingKeyboard = isSibling
+            ? {
+                inline_keyboard: [
+                  [
+                    {
+                      text: `Reply: ${threadTitle.slice(0, 24)}`,
+                      callback_data: `bind:${cid}`,
+                    },
+                  ],
+                ],
+              }
+            : undefined;
+
           if (rendered) {
+            const payload = isSibling
+              ? `[${folderName ?? "folder"} | ${threadTitle}]\n\n${rendered}`
+              : rendered;
             await this.sendChunked(
               binding.chatId,
-              rendered,
-              binding.messageThreadId
+              payload,
+              binding.messageThreadId,
+              siblingKeyboard
             );
           }
 
           if (event.kind === "assistant_reply") {
-            for (const q of event.questions) {
-              if (q.options.length === 0) continue;
-              const buttons: InlineKeyboardButton[][] = q.options.map(
-                (opt, idx) => {
-                  const optKey = `q:${event.stepIndex}:${idx}`;
-                  this.rememberQuestionOption(optKey, opt);
-                  return [{ text: opt.slice(0, 48), callback_data: optKey }];
-                }
-              );
-              await this.telegram.sendMessage({
-                chatId: binding.chatId,
-                messageThreadId: binding.messageThreadId,
-                text: `Reply with an option for: ${q.question}`,
-                replyMarkup: { inline_keyboard: buttons },
-              });
+            if (!isSibling) {
+              for (const q of event.questions) {
+                if (q.options.length === 0) continue;
+                const buttons: InlineKeyboardButton[][] = q.options.map(
+                  (opt, idx) => {
+                    const optKey = `q:${event.stepIndex}:${idx}`;
+                    this.rememberQuestionOption(optKey, opt);
+                    return [{ text: opt.slice(0, 48), callback_data: optKey }];
+                  }
+                );
+                await this.telegram.sendMessage({
+                  chatId: binding.chatId,
+                  messageThreadId: binding.messageThreadId,
+                  text: `Reply with an option for: ${q.question}`,
+                  replyMarkup: { inline_keyboard: buttons },
+                });
+              }
             }
 
             for (const imgPath of event.imagePaths) {
               await this.telegram.sendPhoto({
                 chatId: binding.chatId,
                 filePath: imgPath,
-                caption: path.basename(imgPath),
+                caption: isSibling
+                  ? `[${threadTitle}] ${path.basename(imgPath)}`
+                  : path.basename(imgPath),
                 messageThreadId: binding.messageThreadId,
               });
             }

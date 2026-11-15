@@ -1,10 +1,28 @@
 import { Database } from "bun:sqlite";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { TranscriptCursor } from "./state.ts";
 
+export type SessionFolder = {
+  id: string;
+  name: string;
+  workspaces: string[];
+  primaryWorkspace: string;
+  activeThreadCount: number;
+  latestThreadTime: string | null;
+};
+
+export type AnnotationMeta = {
+  archived: boolean;
+  pinned: boolean;
+  title?: string;
+};
+
 export type ConversationSummary = {
   conversationId: string;
+  projectId: string | null;
+  folderName: string | null;
   title: string;
   preview: string;
   stepCount: number;
@@ -13,6 +31,7 @@ export type ConversationSummary = {
   primaryWorkspace: string;
   status: string;
   notFullyIdle: boolean;
+  pinned: boolean;
 };
 
 export type QuestionChoice = {
@@ -59,26 +78,143 @@ type RawTranscriptStep = {
 
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 
+function decodeFileUri(uri: string): string {
+  if (uri.startsWith("file://")) {
+    return decodeURIComponent(uri.slice("file://".length));
+  }
+  return uri;
+}
+
 function parseWorkspaceUris(rawJson: string): string[] {
   try {
     const parsed = JSON.parse(rawJson) as unknown;
     if (!Array.isArray(parsed)) return [];
     return parsed
       .filter((item): item is string => typeof item === "string")
-      .map((uri) => {
-        if (uri.startsWith("file://")) {
-          return decodeURIComponent(uri.slice("file://".length));
-        }
-        return uri;
-      });
+      .map(decodeFileUri);
   } catch {
     return [];
   }
 }
 
+function pickPrimaryWorkspacePath(paths: string[]): string {
+  if (paths.length === 0) return "";
+  return paths.find((item) => !item.includes("/.agents/")) ?? paths[0] ?? "";
+}
+
 function formatWorkspaceLabel(paths: string[]): string {
-  if (paths.length === 0) return "workspace";
-  return path.basename(paths[0]) || paths[0];
+  const primary = pickPrimaryWorkspacePath(paths);
+  if (!primary) return "workspace";
+  return path.basename(primary) || primary;
+}
+
+function defaultProjectsDir(): string {
+  return path.join(os.homedir(), ".gemini", "config", "projects");
+}
+
+/**
+ * Parse Antigravity sidebar annotation metadata (archived, pinned, custom title).
+ */
+export function readAnnotationMeta(
+  dataDir: string,
+  conversationId: string
+): AnnotationMeta {
+  const pbtxtPath = path.join(dataDir, "annotations", `${conversationId}.pbtxt`);
+  if (!fs.existsSync(pbtxtPath)) {
+    return { archived: false, pinned: false };
+  }
+
+  try {
+    const raw = fs.readFileSync(pbtxtPath, "utf8");
+    const archived = /^\s*archived\s*:\s*true\b/m.test(raw);
+    const pinned = /^\s*pinned\s*:\s*true\b/m.test(raw);
+    const titleMatch = raw.match(/^\s*title\s*:\s*"((?:[^"\\]|\\.)*)"/m);
+    const title = titleMatch
+      ? titleMatch[1].replace(/\\(.)/g, (_all, ch: string) => {
+          if (ch === "n") return "\n";
+          if (ch === "t") return "\t";
+          return ch;
+        })
+      : undefined;
+    return { archived, pinned, title };
+  } catch {
+    return { archived: false, pinned: false };
+  }
+}
+
+type ProjectFolderDef = {
+  id: string;
+  name: string;
+  workspaces: string[];
+  primaryWorkspace: string;
+};
+
+type RawProjectResource = {
+  folderUri?: unknown;
+  gitFolder?: { folderUri?: unknown };
+};
+
+type RawProjectJson = {
+  id?: unknown;
+  name?: unknown;
+  projectResources?: {
+    resources?: RawProjectResource[];
+  };
+};
+
+function loadProjectFolderDefs(projectsDir?: string): ProjectFolderDef[] {
+  const dir = projectsDir ?? defaultProjectsDir();
+  if (!fs.existsSync(dir)) return [];
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir).filter((name) => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+
+  const folders: ProjectFolderDef[] = [];
+  for (const filename of entries) {
+    try {
+      const parsed = JSON.parse(
+        fs.readFileSync(path.join(dir, filename), "utf8")
+      ) as RawProjectJson;
+      const id = typeof parsed.id === "string" ? parsed.id.trim() : "";
+      const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
+      if (!id || !name) continue;
+
+      const seen = new Set<string>();
+      const workspaces: string[] = [];
+      const resources = parsed.projectResources?.resources ?? [];
+      if (Array.isArray(resources)) {
+        for (const item of resources) {
+          const rawUri =
+            typeof item?.folderUri === "string"
+              ? item.folderUri
+              : typeof item?.gitFolder?.folderUri === "string"
+                ? item.gitFolder.folderUri
+                : "";
+          if (!rawUri) continue;
+          const decoded = decodeFileUri(rawUri);
+          if (!seen.has(decoded)) {
+            seen.add(decoded);
+            workspaces.push(decoded);
+          }
+        }
+      }
+
+      folders.push({
+        id,
+        name,
+        workspaces,
+        primaryWorkspace: pickPrimaryWorkspacePath(workspaces),
+      });
+    } catch {
+      // Ignore malformed project JSON files outside valid Desktop folder metadata.
+    }
+  }
+
+  return folders;
 }
 
 function buildSafeFtsQuery(query: string): string {
@@ -92,24 +228,178 @@ function buildSafeFtsQuery(query: string): string {
 }
 
 /**
+ * List Antigravity Desktop Session Folders enriched with active non-archived thread counts.
+ */
+export function listSessionFolders(
+  dataDir: string,
+  options: { projectsDir?: string } = {}
+): SessionFolder[] {
+  const defs = loadProjectFolderDefs(options.projectsDir);
+  if (defs.length === 0) return [];
+
+  const counts = new Map<string, number>();
+  const latestTimes = new Map<string, string>();
+  const dbPath = path.join(dataDir, "conversation_summaries.db");
+
+  if (fs.existsSync(dbPath)) {
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const cols = db
+        .query<{ name: string }, []>("PRAGMA table_info(conversation_summaries)")
+        .all();
+      const hasProjectId = cols.some((col) => col.name === "project_id");
+      if (hasProjectId) {
+        type FolderRow = {
+          conversation_id: string;
+          project_id: string;
+          last_modified_time: string;
+        };
+        const rows = db
+          .query<FolderRow, []>(
+            `SELECT conversation_id, project_id, last_modified_time
+             FROM conversation_summaries
+             WHERE nesting_depth = 0
+               AND killed = 0
+               AND project_id != ''
+             ORDER BY last_modified_time DESC`
+          )
+          .all();
+
+        for (const row of rows) {
+          if (readAnnotationMeta(dataDir, row.conversation_id).archived) {
+            continue;
+          }
+          counts.set(row.project_id, (counts.get(row.project_id) ?? 0) + 1);
+          if (!latestTimes.has(row.project_id)) {
+            latestTimes.set(row.project_id, row.last_modified_time);
+          }
+        }
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  return defs
+    .map((def) => ({
+      ...def,
+      activeThreadCount: counts.get(def.id) ?? 0,
+      latestThreadTime: latestTimes.get(def.id) ?? null,
+    }))
+    .sort((a, b) => {
+      if (a.latestThreadTime && b.latestThreadTime) {
+        const cmp = b.latestThreadTime.localeCompare(a.latestThreadTime);
+        if (cmp !== 0) return cmp;
+      } else if (a.latestThreadTime || b.latestThreadTime) {
+        return a.latestThreadTime ? -1 : 1;
+      }
+      if (b.activeThreadCount !== a.activeThreadCount) {
+        return b.activeThreadCount - a.activeThreadCount;
+      }
+      return a.name.localeCompare(b.name);
+    });
+}
+
+/**
+ * Resolve an Antigravity Session Folder by exact name, UUID, or unique prefix.
+ */
+export function resolveSessionFolder(
+  dataDir: string,
+  nameOrIdOrPrefix: string,
+  options: { projectsDir?: string } = {}
+): SessionFolder | null {
+  const needle = nameOrIdOrPrefix.trim();
+  if (!needle) return null;
+
+  const folders = listSessionFolders(dataDir, options);
+  const lower = needle.toLowerCase();
+
+  const exactId = folders.find((item) => item.id === needle);
+  if (exactId) return exactId;
+
+  const exactNames = folders.filter((item) => item.name.toLowerCase() === lower);
+  if (exactNames.length === 1) return exactNames[0];
+  if (exactNames.length > 1) {
+    throw new Error(
+      `Folder name "${needle}" matched ${exactNames.length} folders; pass its UUID prefix`
+    );
+  }
+
+  const idPrefixes = folders.filter((item) => item.id.startsWith(needle));
+  if (idPrefixes.length === 1) return idPrefixes[0];
+  if (idPrefixes.length > 1) {
+    throw new Error(
+      `Folder ID prefix "${needle}" matched ${idPrefixes.length} folders; pass more characters`
+    );
+  }
+
+  const namePrefixes = folders.filter((item) =>
+    item.name.toLowerCase().startsWith(lower)
+  );
+  if (namePrefixes.length === 1) return namePrefixes[0];
+  if (namePrefixes.length > 1) {
+    throw new Error(
+      `Folder "${needle}" matched ${namePrefixes.length} folders: ${namePrefixes
+        .map((item) => item.name)
+        .join(", ")}`
+    );
+  }
+
+  const nameIncludes = folders.filter((item) =>
+    item.name.toLowerCase().includes(lower)
+  );
+  if (nameIncludes.length === 1) return nameIncludes[0];
+  if (nameIncludes.length > 1) {
+    throw new Error(
+      `Folder "${needle}" matched ${nameIncludes.length} folders: ${nameIncludes
+        .map((item) => item.name)
+        .join(", ")}`
+    );
+  }
+
+  return null;
+}
+
+/**
  * Query top-level Antigravity Desktop threads from conversation_summaries.db in read-only mode.
  */
 export function listConversations(
   dataDir: string,
-  options: { limit?: number; query?: string } = {}
+  options: {
+    limit?: number;
+    query?: string;
+    folderId?: string | null;
+    projectsDir?: string;
+    includeArchived?: boolean;
+  } = {}
 ): ConversationSummary[] {
   const dbPath = path.join(dataDir, "conversation_summaries.db");
   if (!fs.existsSync(dbPath)) {
     throw new Error(`Antigravity database not found at ${dbPath}`);
   }
 
-  const limit = Math.max(1, Math.min(50, options.limit ?? 10));
+  const limit = Math.max(1, Math.min(200, options.limit ?? 10));
+  const fetchLimit = options.includeArchived
+    ? limit
+    : Math.min(500, Math.max(limit * 6, 80));
   const safeFts = options.query ? buildSafeFtsQuery(options.query) : "";
+  const folderNameById = new Map(
+    loadProjectFolderDefs(options.projectsDir).map((folder) => [
+      folder.id,
+      folder.name,
+    ])
+  );
   const db = new Database(dbPath, { readonly: true });
 
   try {
+    const hasProjectId = db
+      .query<{ name: string }, []>("PRAGMA table_info(conversation_summaries)")
+      .all()
+      .some((col) => col.name === "project_id");
+
     type Row = {
       conversation_id: string;
+      project_id: string;
       title: string;
       preview: string;
       step_count: number;
@@ -119,38 +409,44 @@ export function listConversations(
       not_fully_idle: number;
     };
 
-    let rows: Row[];
+    const projectSelect = hasProjectId ? "project_id" : "'' AS project_id";
+    const whereClauses = ["nesting_depth = 0", "killed = 0"];
+    const params: Array<string | number> = [];
+
+    if (options.folderId && hasProjectId) {
+      whereClauses.push("project_id = ?");
+      params.push(options.folderId);
+    }
     if (safeFts) {
-      rows = db
-        .query<Row, [string, number]>(
-          `SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
-           FROM conversation_summaries
-           WHERE nesting_depth = 0
-             AND killed = 0
-             AND conversation_id IN (
-               SELECT DISTINCT conversation_id FROM conversations_fts WHERE conversations_fts MATCH ?
-             )
-           ORDER BY last_modified_time DESC
-           LIMIT ?`
-        )
-        .all(safeFts, limit);
-    } else {
-      rows = db
-        .query<Row, [number]>(
-          `SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
-           FROM conversation_summaries
-           WHERE nesting_depth = 0 AND killed = 0
-           ORDER BY last_modified_time DESC
-           LIMIT ?`
-        )
-        .all(limit);
+      whereClauses.push(
+        "conversation_id IN (SELECT DISTINCT conversation_id FROM conversations_fts WHERE conversations_fts MATCH ?)"
+      );
+      params.push(safeFts);
     }
 
-    return rows.map((row) => {
+    params.push(fetchLimit);
+    const sql = `SELECT conversation_id, ${projectSelect}, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle
+       FROM conversation_summaries
+       WHERE ${whereClauses.join(" AND ")}
+       ORDER BY last_modified_time DESC
+       LIMIT ?`;
+
+    const rows = db.query<Row, Array<string | number>>(sql).all(...params);
+    const results: ConversationSummary[] = [];
+
+    for (const row of rows) {
+      const meta = readAnnotationMeta(dataDir, row.conversation_id);
+      if (!options.includeArchived && meta.archived) {
+        continue;
+      }
+
       const workspaces = parseWorkspaceUris(row.workspace_uris);
-      return {
+      const projectId = row.project_id?.trim() || null;
+      results.push({
         conversationId: row.conversation_id,
-        title: row.title || "Untitled",
+        projectId,
+        folderName: projectId ? (folderNameById.get(projectId) ?? null) : null,
+        title: meta.title?.trim() || row.title || "Untitled",
         preview: row.preview || "",
         stepCount: row.step_count,
         lastModifiedTime: row.last_modified_time,
@@ -158,8 +454,15 @@ export function listConversations(
         primaryWorkspace: formatWorkspaceLabel(workspaces),
         status: row.status,
         notFullyIdle: Boolean(row.not_fully_idle),
-      };
-    });
+        pinned: meta.pinned,
+      });
+
+      if (results.length >= limit) {
+        break;
+      }
+    }
+
+    return results;
   } finally {
     db.close();
   }
@@ -170,11 +473,16 @@ export function listConversations(
  */
 export function resolveConversationByPrefix(
   dataDir: string,
-  idOrPrefix: string
+  idOrPrefix: string,
+  options: { folderId?: string | null; projectsDir?: string } = {}
 ): ConversationSummary | null {
   const needle = idOrPrefix.trim();
   if (!needle) return null;
-  const recent = listConversations(dataDir, { limit: 50 });
+  const recent = listConversations(dataDir, {
+    limit: 200,
+    includeArchived: true,
+    projectsDir: options.projectsDir,
+  });
   const exact = recent.find((item) => item.conversationId === needle);
   if (exact) return exact;
   const prefixMatches = recent.filter((item) =>
@@ -182,6 +490,14 @@ export function resolveConversationByPrefix(
   );
   if (prefixMatches.length === 1) {
     return prefixMatches[0];
+  }
+  if (prefixMatches.length > 1 && options.folderId) {
+    const inFolder = prefixMatches.filter(
+      (item) => item.projectId === options.folderId
+    );
+    if (inFolder.length === 1) {
+      return inFolder[0];
+    }
   }
   if (prefixMatches.length > 1) {
     throw new Error(
@@ -194,11 +510,21 @@ export function resolveConversationByPrefix(
 async function runAgentApi(
   agentApiBin: string,
   args: string[],
-  cwd?: string,
-  timeoutMs = 15000
+  options: {
+    cwd?: string;
+    projectId?: string | null;
+    timeoutMs?: number;
+  } = {}
 ): Promise<{ stdout: string; stderr: string }> {
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const projectId = options.projectId?.trim();
+  const env = projectId
+    ? { ...process.env, ANTIGRAVITY_PROJECT_ID: projectId }
+    : process.env;
+
   const proc = Bun.spawn([agentApiBin, ...args], {
-    cwd,
+    cwd: options.cwd,
+    env,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -250,18 +576,19 @@ export async function sendMessageToDesktop(
   agentApiBin: string,
   conversationId: string,
   content: string,
-  title?: string
+  title?: string,
+  projectId?: string | null
 ): Promise<void> {
   const args = ["send-message"];
   if (title && title.trim()) {
     args.push(`--title=${title.trim()}`);
   }
   args.push(conversationId, content);
-  await runAgentApi(agentApiBin, args);
+  await runAgentApi(agentApiBin, args, { projectId });
 }
 
 /**
- * Start a brand new Desktop conversation scoped to the given workspace directory.
+ * Start a brand new Desktop conversation scoped to the given workspace and optional Session Folder.
  */
 export async function startDesktopConversation(
   agentApiBin: string,
@@ -270,6 +597,7 @@ export async function startDesktopConversation(
     title?: string;
     model?: string | null;
     cwd?: string;
+    projectId?: string | null;
   }
 ): Promise<string> {
   const args = ["new-conversation"];
@@ -281,7 +609,10 @@ export async function startDesktopConversation(
   }
   args.push("--", options.prompt);
 
-  const { stdout } = await runAgentApi(agentApiBin, args, options.cwd);
+  const { stdout } = await runAgentApi(agentApiBin, args, {
+    cwd: options.cwd,
+    projectId: options.projectId,
+  });
   const parsed = JSON.parse(stdout) as {
     conversationId?: string;
     response?: { newConversation?: { conversationId?: string } };

@@ -9,6 +9,10 @@ export type ThreadBinding = {
   conversationId: string;
   title: string;
   workspace: string;
+  folderId?: string;
+  folderName?: string;
+  watchFolder?: boolean;
+  folderSyncedAt?: string;
   flowGenEn: ComposeMode;
   updatedAt: string;
 };

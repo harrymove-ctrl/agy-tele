@@ -85,6 +85,8 @@ describe("daemon: Telegram <-> Antigravity Desktop sync", () => {
     const threads: ConversationSummary[] = [
       {
         conversationId: cid,
+        projectId: null,
+        folderName: null,
         title: "AVM Studio Polish",
         preview: "Liquid glass",
         stepCount: 1,
@@ -93,18 +95,21 @@ describe("daemon: Telegram <-> Antigravity Desktop sync", () => {
         primaryWorkspace: "ai-video-maker",
         status: "CASCADE_RUN_STATUS_IDLE",
         notFullyIdle: false,
+        pinned: false,
       },
     ];
 
-    const injectedPrompts: Array<{ cid: string; content: string }> = [];
+    const injectedPrompts: Array<{ cid: string; content: string; projectId?: string | null }> = [];
 
     const bridge: DesktopBridge = {
+      listSessionFolders: () => [],
+      resolveSessionFolder: () => null,
       listConversations: () => threads,
       resolveConversationByPrefix: (_dir, prefix) =>
         threads.find((t) => t.conversationId.startsWith(prefix)) ?? null,
       getConversationMetadata: async () => ({ status: "ok" }),
-      sendMessageToDesktop: async (_bin, targetCid, content) => {
-        injectedPrompts.push({ cid: targetCid, content });
+      sendMessageToDesktop: async (_bin, targetCid, content, _title, projectId) => {
+        injectedPrompts.push({ cid: targetCid, content, projectId });
       },
       startDesktopConversation: async () => cid,
       readTranscriptDelta,
@@ -120,6 +125,8 @@ describe("daemon: Telegram <-> Antigravity Desktop sync", () => {
       defaultChatId: null,
       agyDataDir: root,
       agyBrainDir: brainDir,
+      agyProjectsDir: path.join(root, "projects"),
+      defaultFolder: null,
       agentApiBin: "/usr/bin/true",
       defaultWorkspace: "/Volumes/Dev",
       defaultModel: null,
@@ -257,5 +264,245 @@ describe("daemon: Telegram <-> Antigravity Desktop sync", () => {
     });
     expect(injectedPrompts).toHaveLength(2);
     expect(injectedPrompts[1].content).toBe("Merge to dev");
+  });
+
+  test("syncs a Telegram chat with an Antigravity Session Folder, watches sibling automations, and switches target on button tap", async () => {
+    const root = makeTempDir();
+    const brainDir = path.join(root, "brain");
+    const folderId = "325113ab-f784-4fd3-87dc-e1a8d67576af";
+    const cidA = "daily-aaaa-1111-2222-333344445555";
+    const cidB = "daily-bbbb-1111-2222-333344445555";
+
+    for (const cid of [cidA, cidB]) {
+      const logsDir = path.join(brainDir, cid, ".system_generated", "logs");
+      fs.mkdirSync(logsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(logsDir, "transcript.jsonl"),
+        `${JSON.stringify({
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          status: "DONE",
+          content: "<USER_REQUEST>\nInitial task\n</USER_REQUEST>",
+        })}\n`,
+        "utf8"
+      );
+    }
+
+    const folderThreads: ConversationSummary[] = [
+      {
+        conversationId: cidA,
+        projectId: folderId,
+        folderName: "my-working-daily",
+        title: "Winning NASA Competition Guide",
+        preview: "Checked space apps",
+        stepCount: 1,
+        lastModifiedTime: "2026-11-15T07:00:00Z",
+        workspaces: ["/Volumes/Dev/nasa-space-apps-2026"],
+        primaryWorkspace: "nasa-space-apps-2026",
+        status: "CASCADE_RUN_STATUS_IDLE",
+        notFullyIdle: false,
+        pinned: false,
+      },
+      {
+        conversationId: cidB,
+        projectId: folderId,
+        folderName: "my-working-daily",
+        title: "Automated Daily Hackathon",
+        preview: "Found new hackathon",
+        stepCount: 1,
+        lastModifiedTime: "2026-11-15T06:50:00Z",
+        workspaces: ["/Volumes/Dev/hackathon-registry"],
+        primaryWorkspace: "hackathon-registry",
+        status: "CASCADE_RUN_STATUS_IDLE",
+        notFullyIdle: false,
+        pinned: false,
+      },
+    ];
+
+    const startedCalls: Array<{ prompt: string; cwd?: string; projectId?: string | null }> = [];
+    const sentCalls: Array<{ cid: string; content: string; projectId?: string | null }> = [];
+
+    const folderDef = {
+      id: folderId,
+      name: "my-working-daily",
+      workspaces: ["/Volumes/Dev/nasa-space-apps-2026"],
+      primaryWorkspace: "/Volumes/Dev/nasa-space-apps-2026",
+      activeThreadCount: 2,
+      latestThreadTime: "2026-11-15T07:00:00Z",
+    };
+
+    const bridge: DesktopBridge = {
+      listSessionFolders: () => [folderDef],
+      resolveSessionFolder: (_dir, needle) =>
+        needle === "my-working-daily" || needle === folderId ? folderDef : null,
+      listConversations: (_dir, opts) => {
+        if (opts?.folderId && opts.folderId !== folderId) return [];
+        return folderThreads;
+      },
+      resolveConversationByPrefix: (_dir, prefix) =>
+        folderThreads.find((t) => t.conversationId.startsWith(prefix)) ?? null,
+      getConversationMetadata: async () => ({ status: "ok" }),
+      sendMessageToDesktop: async (_bin, targetCid, content, _title, projectId) => {
+        sentCalls.push({ cid: targetCid, content, projectId });
+      },
+      startDesktopConversation: async (_bin, opts) => {
+        startedCalls.push({
+          prompt: opts.prompt,
+          cwd: opts.cwd,
+          projectId: opts.projectId,
+        });
+        return "daily-cccc-new";
+      },
+      readTranscriptDelta,
+      readRecentTranscriptEvents,
+      initCursorAtEof,
+      composeEnglishPrompt: (raw, opts) =>
+        composeEnglishPrompt(raw, { ...opts, offline: true }),
+    };
+
+    const cfg: AppConfig = {
+      telegramBotToken: "test-token",
+      allowedUserIds: [4242],
+      defaultChatId: null,
+      agyDataDir: root,
+      agyBrainDir: brainDir,
+      agyProjectsDir: path.join(root, "projects"),
+      defaultFolder: "my-working-daily",
+      agentApiBin: "/usr/bin/true",
+      defaultWorkspace: "/Volumes/Dev",
+      defaultModel: null,
+      flowGenEn: "auto",
+      pollMs: 200,
+      statePath: path.join(root, "state.json"),
+    };
+
+    const telegram = new MockTelegramClient();
+    const daemon = new AgyTeleDaemon(cfg, telegram, bridge);
+
+    // 1. /status auto-syncs the default folder and binds its newest thread cleanly.
+    await daemon.handleUpdate({
+      update_id: 10,
+      message: {
+        message_id: 20,
+        from: { id: 4242, username: "harry" },
+        chat: { id: 777, type: "private" },
+        text: "/status",
+      },
+    });
+    expect(telegram.sentMessages[0].text).toContain("Folder: my-working-daily");
+    expect(daemon.getState().bindings["777:main"]?.folderId).toBe(folderId);
+    expect(daemon.getState().bindings["777:main"]?.watchFolder).toBe(true);
+    expect(daemon.getState().bindings["777:main"]?.conversationId).toBe(cidA);
+
+    // 2. Sibling automation (cidB) in the same folder posts an update -> streamed with switch button.
+    const countBeforeSibling = telegram.sentMessages.length;
+    fs.appendFileSync(
+      path.join(brainDir, cidB, ".system_generated", "logs", "transcript.jsonl"),
+      `${JSON.stringify({
+        step_index: 1,
+        source: "MODEL",
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        content: "Scouted 2 new AI hackathons closing Nov 28.",
+      })}\n`,
+      "utf8"
+    );
+
+    const siblingDelivered = await daemon.syncTranscriptsOnce();
+    expect(siblingDelivered).toBe(1);
+    const siblingMsg = telegram.sentMessages[countBeforeSibling];
+    expect(siblingMsg.text).toContain("[my-working-daily | Automated Daily Hackathon]");
+    expect(siblingMsg.text).toContain("Scouted 2 new AI hackathons closing Nov 28.");
+    expect(
+      siblingMsg.replyMarkup?.inline_keyboard[0][0].callback_data
+    ).toBe(`bind:${cidB}`);
+
+    // 3. Tapping the inline button switches active reply target to cidB while keeping folder watch active.
+    await daemon.handleUpdate({
+      update_id: 11,
+      callback_query: {
+        id: "cb-folder-switch",
+        from: { id: 4242, username: "harry" },
+        data: `bind:${cidB}`,
+        message: {
+          message_id: 21,
+          chat: { id: 777, type: "private" },
+        },
+      },
+    });
+    expect(daemon.getState().bindings["777:main"]?.conversationId).toBe(cidB);
+    expect(daemon.getState().bindings["777:main"]?.watchFolder).toBe(true);
+
+    // 4. Plain message forwards into cidB with ANTIGRAVITY_PROJECT_ID (folderId).
+    await daemon.handleUpdate({
+      update_id: 12,
+      message: {
+        message_id: 22,
+        from: { id: 4242, username: "harry" },
+        chat: { id: 777, type: "private" },
+        text: "/raw Save that workflow to hackathon-architect",
+      },
+    });
+    expect(sentCalls).toHaveLength(1);
+    expect(sentCalls[0].cid).toBe(cidB);
+    expect(sentCalls[0].projectId).toBe(folderId);
+
+    // 5. /new starts a conversation inside the synced folder with ANTIGRAVITY_PROJECT_ID set.
+    await daemon.handleUpdate({
+      update_id: 13,
+      message: {
+        message_id: 23,
+        from: { id: 4242, username: "harry" },
+        chat: { id: 777, type: "private" },
+        text: "/new Track Solana Radar hackathon deadlines",
+      },
+    });
+    expect(startedCalls).toHaveLength(1);
+    expect(startedCalls[0].projectId).toBe(folderId);
+    expect(daemon.getState().bindings["777:main"]?.folderId).toBe(folderId);
+
+    // 6. /folders renders Session Folder buttons and /threads respects folder scope.
+    const countBeforeFolders = telegram.sentMessages.length;
+    await daemon.handleUpdate({
+      update_id: 14,
+      message: {
+        message_id: 24,
+        from: { id: 4242, username: "harry" },
+        chat: { id: 777, type: "private" },
+        text: "/folders",
+      },
+    });
+    expect(telegram.sentMessages[countBeforeFolders].text).toContain("my-working-daily");
+    expect(
+      telegram.sentMessages[countBeforeFolders].replyMarkup?.inline_keyboard[0][0].callback_data
+    ).toBe(`folder:${folderId}`);
+
+    const countBeforeScopedThreads = telegram.sentMessages.length;
+    await daemon.handleUpdate({
+      update_id: 15,
+      message: {
+        message_id: 25,
+        from: { id: 4242, username: "harry" },
+        chat: { id: 777, type: "private" },
+        text: "/threads",
+      },
+    });
+    expect(telegram.sentMessages[countBeforeScopedThreads].text).toContain(
+      "Folder: my-working-daily"
+    );
+
+    // 7. /folder off detaches the folder watch cleanly while keeping the thread bound.
+    await daemon.handleUpdate({
+      update_id: 16,
+      message: {
+        message_id: 26,
+        from: { id: 4242, username: "harry" },
+        chat: { id: 777, type: "private" },
+        text: "/folder off",
+      },
+    });
+    expect(daemon.getState().bindings["777:main"]?.watchFolder).toBeUndefined();
+    expect(daemon.getState().bindings["777:main"]?.folderId).toBeUndefined();
   });
 });

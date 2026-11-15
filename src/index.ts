@@ -17,6 +17,9 @@ export {
 } from "./composer.ts";
 
 export {
+  listSessionFolders,
+  resolveSessionFolder,
+  readAnnotationMeta,
   listConversations,
   resolveConversationByPrefix,
   getConversationMetadata,
@@ -25,6 +28,8 @@ export {
   readTranscriptDelta,
   readRecentTranscriptEvents,
   chunkTelegramText,
+  type SessionFolder,
+  type AnnotationMeta,
   type ConversationSummary,
   type QuestionChoice,
   type TranscriptEvent,

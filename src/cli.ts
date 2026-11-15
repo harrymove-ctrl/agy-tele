@@ -2,7 +2,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { getConversationMetadata, listConversations } from "./antigravity.ts";
+import {
+  getConversationMetadata,
+  listConversations,
+  listSessionFolders,
+  resolveSessionFolder,
+} from "./antigravity.ts";
 import { composeEnglishPrompt, type ComposeMode } from "./composer.ts";
 import { loadConfig } from "./config.ts";
 import { AgyTeleDaemon } from "./daemon.ts";
@@ -67,24 +72,31 @@ function printUsage(): void {
       "Usage: agy-tele <command> [options]",
       "",
       "Commands:",
-      "  start                                    Run two-way Telegram and Antigravity daemon",
-      "  doctor                                   Verify agentapi, SQLite index, and env setup",
-      "  threads [--search <q>] [--limit <n>]     List recent top-level Desktop threads",
-      "  compose [--offline] [--mode <m>] <text>  Run Flow-Gen-EN + No-AI-Slop prompt composer",
-      "  install-launchd [--load]                 Write macOS LaunchAgent plist for 24/7 daemon",
-      "  uninstall-launchd                        Unload and remove LaunchAgent plist",
+      "  start                                              Run two-way Telegram and Antigravity daemon",
+      "  doctor                                             Verify agentapi, SQLite index, folders, and env",
+      "  folders                                            List Desktop Session Folders and thread counts",
+      "  threads [--folder <f>] [--search <q>] [--limit n]  List top-level Desktop threads",
+      "  compose [--offline] [--mode <m>] <text>            Run Flow-Gen-EN + No-AI-Slop prompt composer",
+      "  install-launchd [--load]                           Write macOS LaunchAgent plist for 24/7 daemon",
+      "  uninstall-launchd                                  Unload and remove LaunchAgent plist",
     ].join("\n")
   );
 }
 
 async function runDoctor(): Promise<number> {
   const cfg = loadConfig(process.env, false);
-  const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
+  const checks: Array<{
+    name: string;
+    ok: boolean;
+    required: boolean;
+    detail: string;
+  }> = [];
 
   const agentApiExists = fs.existsSync(cfg.agentApiBin);
   checks.push({
     name: "agentapi binary",
     ok: agentApiExists,
+    required: true,
     detail: agentApiExists ? cfg.agentApiBin : `missing at ${cfg.agentApiBin}`,
   });
 
@@ -97,7 +109,10 @@ async function runDoctor(): Promise<number> {
   if (fs.existsSync(dbPath)) {
     try {
       const startMs = performance.now();
-      const threads = listConversations(cfg.agyDataDir, { limit: 10 });
+      const threads = listConversations(cfg.agyDataDir, {
+        limit: 10,
+        projectsDir: cfg.agyProjectsDir,
+      });
       const elapsedMs = (performance.now() - startMs).toFixed(1);
       threadCount = threads.length;
       recentCid = threads[0]?.conversationId ?? "";
@@ -107,7 +122,12 @@ async function runDoctor(): Promise<number> {
       dbDetail = err instanceof Error ? err.message : String(err);
     }
   }
-  checks.push({ name: "conversation_summaries.db", ok: dbOk, detail: dbDetail });
+  checks.push({
+    name: "conversation_summaries.db",
+    ok: dbOk,
+    required: true,
+    detail: dbDetail,
+  });
 
   if (agentApiExists && recentCid) {
     try {
@@ -117,12 +137,14 @@ async function runDoctor(): Promise<number> {
       checks.push({
         name: "agentapi IPC ping",
         ok: true,
+        required: true,
         detail: `metadata lookup succeeded in ${elapsedMs}ms (${recentCid.slice(0, 8)})`,
       });
     } catch (err) {
       checks.push({
         name: "agentapi IPC ping",
         ok: false,
+        required: true,
         detail: err instanceof Error ? err.message : String(err),
       });
     }
@@ -132,8 +154,42 @@ async function runDoctor(): Promise<number> {
   checks.push({
     name: "brain log root",
     ok: brainOk,
+    required: true,
     detail: brainOk ? cfg.agyBrainDir : `missing at ${cfg.agyBrainDir}`,
   });
+
+  const foldersExist = fs.existsSync(cfg.agyProjectsDir);
+  if (foldersExist) {
+    const startMs = performance.now();
+    const folders = listSessionFolders(cfg.agyDataDir, {
+      projectsDir: cfg.agyProjectsDir,
+    });
+    const elapsedMs = (performance.now() - startMs).toFixed(1);
+    let defaultOk = true;
+    let defaultDetail = "";
+    if (cfg.defaultFolder) {
+      const resolved = resolveSessionFolder(cfg.agyDataDir, cfg.defaultFolder, {
+        projectsDir: cfg.agyProjectsDir,
+      });
+      defaultOk = resolved !== null;
+      defaultDetail = resolved
+        ? `, default "${resolved.name}" (${resolved.activeThreadCount} active)`
+        : `, AGY_DEFAULT_FOLDER "${cfg.defaultFolder}" not found`;
+    }
+    checks.push({
+      name: "session folders",
+      ok: defaultOk,
+      required: Boolean(cfg.defaultFolder),
+      detail: `${folders.length} folder(s) loaded in ${elapsedMs}ms${defaultDetail}`,
+    });
+  } else {
+    checks.push({
+      name: "session folders",
+      ok: !cfg.defaultFolder,
+      required: Boolean(cfg.defaultFolder),
+      detail: `directory not found at ${cfg.agyProjectsDir}`,
+    });
+  }
 
   const tokenConfigured =
     cfg.telegramBotToken.length > 0 &&
@@ -141,6 +197,7 @@ async function runDoctor(): Promise<number> {
   checks.push({
     name: "telegram auth env",
     ok: tokenConfigured && cfg.allowedUserIds.length > 0,
+    required: false,
     detail:
       tokenConfigured && cfg.allowedUserIds.length > 0
         ? `token present, ${cfg.allowedUserIds.length} allowed user(s)`
@@ -153,33 +210,74 @@ async function runDoctor(): Promise<number> {
   }
 
   const coreReady = checks
-    .slice(0, 4)
+    .filter((item) => item.required)
     .every((item) => item.ok);
   return coreReady ? 0 : 1;
+}
+
+function runFolders(): number {
+  const cfg = loadConfig(process.env, false);
+  const startMs = performance.now();
+  const folders = listSessionFolders(cfg.agyDataDir, {
+    projectsDir: cfg.agyProjectsDir,
+  });
+  const elapsedMs = (performance.now() - startMs).toFixed(1);
+
+  console.log(`Found ${folders.length} session folder(s) in ${elapsedMs}ms:`);
+  for (const item of folders) {
+    const ws = item.primaryWorkspace
+      ? path.basename(item.primaryWorkspace) || item.primaryWorkspace
+      : "workspace";
+    console.log(
+      `${item.id.slice(0, 8)} | ${item.name} | ${item.activeThreadCount} active | ${ws}`
+    );
+  }
+  return 0;
 }
 
 async function runThreads(args: string[]): Promise<number> {
   let limit = 10;
   let query = "";
+  let folderArg = "";
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--limit" && args[i + 1]) {
       limit = Number.parseInt(args[++i], 10) || 10;
     } else if (args[i] === "--search" && args[i + 1]) {
       query = args[++i];
+    } else if (args[i] === "--folder" && args[i + 1]) {
+      folderArg = args[++i];
     }
   }
 
   const cfg = loadConfig(process.env, false);
+  let folderId: string | undefined;
+  if (folderArg) {
+    const folder = resolveSessionFolder(cfg.agyDataDir, folderArg, {
+      projectsDir: cfg.agyProjectsDir,
+    });
+    if (!folder) {
+      console.error(`Session folder not found: "${folderArg}"`);
+      return 1;
+    }
+    folderId = folder.id;
+  }
+
   const startMs = performance.now();
-  const rows = listConversations(cfg.agyDataDir, { limit, query });
+  const rows = listConversations(cfg.agyDataDir, {
+    limit,
+    query,
+    folderId,
+    projectsDir: cfg.agyProjectsDir,
+  });
   const elapsedMs = (performance.now() - startMs).toFixed(1);
 
   console.log(`Found ${rows.length} thread(s) in ${elapsedMs}ms:`);
   for (const item of rows) {
     const state = item.status.includes("RUNNING") ? "running" : "idle";
+    const folderCol = item.folderName ? ` [${item.folderName}]` : "";
     console.log(
-      `${item.conversationId.slice(0, 8)} | ${item.primaryWorkspace} | ${state} | ${item.stepCount} steps | ${item.title}`
+      `${item.conversationId.slice(0, 8)}${folderCol} | ${item.primaryWorkspace} | ${state} | ${item.stepCount} steps | ${item.title}`
     );
   }
   return 0;
@@ -295,6 +393,9 @@ async function main(): Promise<void> {
       break;
     case "doctor":
       code = await runDoctor();
+      break;
+    case "folders":
+      code = runFolders();
       break;
     case "threads":
       code = await runThreads(rest);

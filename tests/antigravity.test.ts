@@ -6,9 +6,13 @@ import path from "node:path";
 import {
   chunkTelegramText,
   listConversations,
+  listSessionFolders,
+  readAnnotationMeta,
   readRecentTranscriptEvents,
   readTranscriptDelta,
   resolveConversationByPrefix,
+  resolveSessionFolder,
+  startDesktopConversation,
 } from "../src/antigravity.ts";
 import { initCursorAtEof } from "../src/state.ts";
 
@@ -257,6 +261,145 @@ describe("antigravity: SQLite index and incremental transcript reader", () => {
     const recent = await readRecentTranscriptEvents(brainDir, cid, 2);
     expect(recent).toHaveLength(2);
     expect(recent[1].stepIndex).toBe(3);
+  });
+
+  test("discovers Session Folders, hides archived annotations, applies sidebar title overrides, and forwards ANTIGRAVITY_PROJECT_ID", async () => {
+    const root = makeTempDir();
+    const dataDir = path.join(root, "antigravity");
+    const projectsDir = path.join(root, "projects");
+    const annotationsDir = path.join(dataDir, "annotations");
+    fs.mkdirSync(annotationsDir, { recursive: true });
+    fs.mkdirSync(projectsDir, { recursive: true });
+
+    const folderId = "325113ab-f784-4fd3-87dc-e1a8d67576af";
+    const otherFolderId = "99998888-7777-6666-5555-444433332222";
+
+    fs.writeFileSync(
+      path.join(projectsDir, `${folderId}.json`),
+      JSON.stringify({
+        id: folderId,
+        name: "my-working-daily",
+        projectResources: {
+          resources: [
+            { folderUri: "file:///Volumes/Dev/.agents/skills/anna-ai-app-builder" },
+            { gitFolder: { folderUri: "file:///Volumes/Dev/gemma-4-developer-agent" } },
+          ],
+        },
+      }),
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(projectsDir, `${otherFolderId}.json`),
+      JSON.stringify({
+        id: otherFolderId,
+        name: "work-other",
+        projectResources: {
+          resources: [{ folderUri: "file:///Volumes/Dev/ai-video-maker" }],
+        },
+      }),
+      "utf8"
+    );
+
+    createMockDb(dataDir);
+    const db = new Database(path.join(dataDir, "conversation_summaries.db"));
+    const insertStmt = db.query(
+      `INSERT INTO conversation_summaries (
+        conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, project_id, nesting_depth, killed, last_user_input_time
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    insertStmt.run(
+      "daily-1111-0000-0000-000000000001",
+      "Raw DB Title",
+      "Scouted hackathon",
+      12,
+      "2026-11-15 07:10:00+00:00",
+      JSON.stringify(["file:///Volumes/Dev/.agents/skills/anna-ai-app-builder"]),
+      "CASCADE_RUN_STATUS_IDLE",
+      folderId,
+      0,
+      0,
+      "2026-11-15 07:09:00+00:00"
+    );
+    insertStmt.run(
+      "daily-2222-0000-0000-000000000002",
+      "Old Hidden Thread",
+      "Done last week",
+      8,
+      "2026-11-15 07:15:00+00:00",
+      JSON.stringify(["file:///Volumes/Dev/near-hackathon"]),
+      "CASCADE_RUN_STATUS_IDLE",
+      folderId,
+      0,
+      0,
+      "2026-11-15 07:14:00+00:00"
+    );
+    db.close();
+
+    fs.writeFileSync(
+      path.join(annotationsDir, "daily-1111-0000-0000-000000000001.pbtxt"),
+      'pinned:true\ntitle:"Renamed Daily Automation"\n',
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(annotationsDir, "daily-2222-0000-0000-000000000002.pbtxt"),
+      "archived:true\n",
+      "utf8"
+    );
+
+    expect(
+      readAnnotationMeta(dataDir, "daily-1111-0000-0000-000000000001")
+    ).toEqual({
+      archived: false,
+      pinned: true,
+      title: "Renamed Daily Automation",
+    });
+
+    const folders = listSessionFolders(dataDir, { projectsDir });
+    expect(folders).toHaveLength(2);
+    expect(folders[0].name).toBe("my-working-daily");
+    expect(folders[0].activeThreadCount).toBe(1);
+    expect(folders[0].primaryWorkspace).toBe("/Volumes/Dev/gemma-4-developer-agent");
+
+    const resolved = resolveSessionFolder(dataDir, "my-working-daily", {
+      projectsDir,
+    });
+    expect(resolved?.id).toBe(folderId);
+
+    const folderThreads = listConversations(dataDir, {
+      folderId,
+      projectsDir,
+      limit: 10,
+    });
+    expect(folderThreads).toHaveLength(1);
+    expect(folderThreads[0].title).toBe("Renamed Daily Automation");
+    expect(folderThreads[0].pinned).toBe(true);
+    expect(folderThreads[0].folderName).toBe("my-working-daily");
+
+    const withArchived = listConversations(dataDir, {
+      folderId,
+      projectsDir,
+      includeArchived: true,
+      limit: 10,
+    });
+    expect(withArchived).toHaveLength(2);
+
+    const fakeAgentApi = path.join(root, "fake-agentapi.sh");
+    const envCaptureFile = path.join(root, "captured-project-id.txt");
+    fs.writeFileSync(
+      fakeAgentApi,
+      `#!/bin/sh\nprintf '%s' "$ANTIGRAVITY_PROJECT_ID" > "${envCaptureFile}"\nprintf '{"conversationId":"created-in-folder"}\n'\n`,
+      "utf8"
+    );
+    fs.chmodSync(fakeAgentApi, 0o755);
+
+    const createdCid = await startDesktopConversation(fakeAgentApi, {
+      prompt: "Track new hackathon",
+      projectId: folderId,
+      cwd: root,
+    });
+    expect(createdCid).toBe("created-in-folder");
+    expect(fs.readFileSync(envCaptureFile, "utf8")).toBe(folderId);
   });
 
   test("chunks long replies cleanly without exceeding Telegram message limits", () => {

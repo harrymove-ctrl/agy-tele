@@ -7,9 +7,12 @@ import {
   chunkTelegramText,
   composeEnglishPrompt,
   listConversations,
+  listSessionFolders,
   loadConfig,
+  readAnnotationMeta,
   readTranscriptDelta,
   resolveConversationByPrefix,
+  resolveSessionFolder,
   scrubNoAiSlop,
   sendMessageToDesktop,
   startDesktopConversation,
@@ -20,6 +23,9 @@ describe("index: public barrel exports", () => {
     expect(typeof composeEnglishPrompt).toBe("function");
     expect(typeof scrubNoAiSlop).toBe("function");
     expect(typeof checkSemanticDrift).toBe("function");
+    expect(typeof listSessionFolders).toBe("function");
+    expect(typeof resolveSessionFolder).toBe("function");
+    expect(typeof readAnnotationMeta).toBe("function");
     expect(typeof listConversations).toBe("function");
     expect(typeof resolveConversationByPrefix).toBe("function");
     expect(typeof readTranscriptDelta).toBe("function");
@@ -30,7 +36,7 @@ describe("index: public barrel exports", () => {
     expect(typeof AgyTeleDaemon).toBe("function");
     expect(typeof HttpTelegramClient).toBe("function");
     expect(Array.isArray(BOT_COMMANDS)).toBe(true);
-    expect(BOT_COMMANDS.length).toBeGreaterThanOrEqual(9);
+    expect(BOT_COMMANDS.length).toBeGreaterThanOrEqual(11);
   });
 
   test("runs the README programmatic composeEnglishPrompt snippet cleanly offline", async () => {
