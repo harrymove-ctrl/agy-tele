@@ -4,13 +4,13 @@
 
 **Drive Antigravity Desktop from Telegram.**
 
-Antigravity Desktop runs fast when you sit in front of your Mac, yet away from your keyboard the official Remote Control feels slow over cellular networks because it mirrors the full desktop UI state over a web relay. When your Mac already stays online 24/7, sending a short text update should take milliseconds rather than seconds of web relay hydration.
+Antigravity Desktop runs fast when you sit in front of your Mac, but away from your desk the official Remote Control feels slow on mobile data because it loads the full desktop UI over a web relay. When your Mac stays online 24/7, sending a short update should take milliseconds instead of seconds.
 
-`agy-tele` runs locally on your Mac as a small Bun daemon (`0` third-party runtime dependencies). It queries Antigravity Desktop's SQLite index in read-only mode, translates casual Vietnamese or Vietlish notes into clean zero-dash English (`Flow-Gen-EN` and `No-AI-Slop`), injects prompts directly via the local `agentapi` IPC binary, watches `transcript.jsonl` for finalized agent turns, and streams replies, interactive `ask_question` buttons, and proof screenshots straight to Telegram.
+`agy-tele` runs on your Mac as a small Bun daemon with `0` third-party runtime dependencies. It reads Antigravity Desktop's SQLite index in read-only mode, turns casual Vietnamese or Vietlish notes into clean plain English (`Flow-Gen-EN` and `No-AI-Slop`), sends prompts straight to the local `agentapi` service, watches `transcript.jsonl` for finished replies, and forwards answers, choice buttons, and screenshots to Telegram.
 
 ## Why not Remote Control, CDP bots, or raw SSH?
 
-Every mobile workflow involves a tradeoff between latency, setup friction, and thread control. `agy-tele` avoids Electron UI scraping and Chromium remote debugging ports by speaking directly to the same local IPC daemon (`agentapi`) and append-only transcript logs that Antigravity Desktop already writes on disk.
+Every phone workflow weighs speed, setup effort, and thread control. `agy-tele` avoids Electron UI scraping and the Chromium debug port by communicating directly with the same local `agentapi` service and log files that Antigravity Desktop has written to disk.
 
 | Capability | `agy-tele` | Official Remote Control | CDP UI Bots (Remoat) | MCP Chat Bridges | SSH + tmux (Termius) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -41,7 +41,7 @@ Every mobile workflow involves a tradeoff between latency, setup friction, and t
 
 ## How It Works Locally
 
-Both directions share local Antigravity Desktop state without scraping desktop windows or opening inbound firewall ports.
+Both sides share local Antigravity Desktop files on disk without touching desktop windows or opening network ports.
 
 ```text
 +------------------------------ [ AGY-TELE DATA FLOW ] ------------------------------+
@@ -74,20 +74,20 @@ Both directions share local Antigravity Desktop state without scraping desktop w
 +------------------------------------------------------------------------------------+
 ```
 
-1. **Session Folder and thread discovery stays read-only**: `src/antigravity.ts` reads folder definitions from `$HOME/.gemini/config/projects/*.json`, filters out `archived:true` rows via `$HOME/.gemini/antigravity/annotations/*.pbtxt`, and opens `$HOME/.gemini/antigravity/conversation_summaries.db` with `{ readonly: true }` (`nesting_depth = 0 AND killed = 0`) so Antigravity Desktop WAL writes never block.
-2. **Inbound prompts run through a local IPC hop**: `agentapi send-message <cid> <prompt>` and `agentapi new-conversation` inject prompts directly into Antigravity's background daemon even when no Desktop window is focused. When synced to a Session Folder, `agy-tele` passes `ANTIGRAVITY_PROJECT_ID=<folderId>` so new threads land directly inside that sidebar folder.
-3. **Echo loops are blocked by step `source`**: `agentapi send-message` writes entries to `transcript.jsonl` with `source: "SYSTEM_SDK"`. `readTranscriptDelta` ignores `SYSTEM_SDK` rows and emits only `USER_EXPLICIT` turns (typed at the Mac) and finalized `MODEL` (`PLANNER_RESPONSE`) turns.
-4. **Byte-offset tailing avoids resending partial writes**: Every poll cycle (triggered by `fs.watch` or the `AGY_POLL_MS` timer) reads only bytes `[byteOffset, size)` ending at a newline byte (`0x0a`). If a log rotates or shrinks (`size < byteOffset`), the cursor resets cleanly to byte `0` and step `-1`.
-5. **Truncated long replies fall back automatically**: When Antigravity marks `"content"` in `truncated_fields` inside compact `transcript.jsonl`, `loadFullStep` scans `transcript_full.jsonl` in reverse to recover the full Markdown response before chunking into `<= 3900` character Telegram messages.
+1. **Reads folders and threads safely**: `src/antigravity.ts` reads Session Folders from `$HOME/.gemini/config/projects/*.json`, skips `archived:true` threads in `annotations/*.pbtxt`, and opens `conversation_summaries.db` in read-only mode so Desktop writes never wait.
+2. **Sends messages straight to Desktop**: `agentapi send-message` and `agentapi new-conversation` talk to the local Antigravity background service even when the app window is closed or minimized. When a chat is synced to a folder, `agy-tele` sets `ANTIGRAVITY_PROJECT_ID` so new chats open right inside that sidebar folder.
+3. **Stops echo loops**: Messages sent from Telegram are saved in `transcript.jsonl` with `source: "SYSTEM_SDK"`. `agy-tele` skips `SYSTEM_SDK` lines and only forwards messages you type on your Mac (`USER_EXPLICIT`) and completed model replies (`PLANNER_RESPONSE`).
+4. **Reads only finished log lines**: On each file change or `650ms` check, the reader scans new bytes up to the last newline (`0x0a`). Half-written lines wait for the next check, and rotated or smaller files reset cleanly to byte `0`.
+5. **Keeps long replies complete**: When `transcript.jsonl` shortens a long answer (`truncated_fields` includes `"content"`), `agy-tele` reads the full reply from `transcript_full.jsonl` and splits it into Telegram messages of `<= 3900` characters.
 
 ## Installation
 
 ### Requirements
 
-1. **macOS host** running Antigravity Desktop (providing `$HOME/.gemini/antigravity/bin/agentapi` and `$HOME/.gemini/antigravity/conversation_summaries.db`).
-2. **Bun `>= 1.3`** (`bun --version`) for TypeScript execution, `bun:sqlite`, and tests.
-3. **Telegram bot token** created via `@BotFather` (`/newbot`).
-4. **Numeric Telegram user ID** retrieved from `@userinfobot` so the fail-closed allowlist accepts only your account.
+1. **A Mac running Antigravity Desktop**: Gives `agy-tele` the local `agentapi` binary (`$HOME/.gemini/antigravity/bin/agentapi`) and the local chat database (`$HOME/.gemini/antigravity/conversation_summaries.db`).
+2. **Bun `>= 1.3`**: Check with `bun --version`. Bun runs the TypeScript daemon, `bun:sqlite`, and tests without extra packages.
+3. **A Telegram bot token**: Open `@BotFather` in Telegram, send `/newbot`, and copy your bot token.
+4. **Your numeric Telegram user ID**: Open `@userinfobot` in Telegram and copy your ID. `agy-tele` ignores messages from any user ID not listed in `.env`.
 
 ### Clone and verify host readiness
 
@@ -133,25 +133,25 @@ Start the foreground daemon from `/Volumes/Dev/agy-tele`:
 bun run start
 ```
 
-Open Telegram (your bot DM or a private group) and sync a Session Folder or thread in 3 steps:
+Open Telegram in your bot DM or a private group and connect a folder or thread in 3 steps:
 
-1. Send `/folders` and tap `[ Sync my-working-daily ]` (or send `/folder my-working-daily`), or skip straight to chatting if `AGY_DEFAULT_FOLDER=my-working-daily` is already set in `.env`.
-2. Send `/threads` to inspect the active non-archived threads inside your synced folder (or `/threads all` for every Desktop thread) and tap one button if you want to switch which thread receives your next reply.
-3. Type a message in English, Vietnamese, or Vietlish (for example `check giúp hackathon mới hôm nay, note lại flow này vào workflow`). If rewritten, the bot previews `[EN] ...`, routes it into the synced folder via `ANTIGRAVITY_PROJECT_ID`, and streams replies from your Desktop folder back to Telegram.
+1. Send `/folders` and tap `[ Sync my-working-daily ]` (or send `/folder my-working-daily`). If `AGY_DEFAULT_FOLDER=my-working-daily` is already set in `.env`, the first message syncs that folder for you.
+2. Send `/threads` to see the active threads in your synced folder (or `/threads all` for every folder), then tap a thread if you want to switch where your next reply goes.
+3. Write a normal message in English, Vietnamese, or Vietlish (for example `check giúp hackathon mới hôm nay, note lại flow này vào workflow`). If the composer rewrites it, the bot previews `[EN] ...`, routes it into your folder via `ANTIGRAVITY_PROJECT_ID`, and sends the Desktop reply back to Telegram.
 
 ## Daily Workflows
 
 ### Syncing a Telegram Chat with an Antigravity Session Folder
 
-If you organize recurring automations, daily hackathon scouts, research notes, and new workflow experiments inside one Antigravity Desktop Session Folder such as `my-working-daily`, you can bind a single Telegram chat directly to that folder instead of managing one chat per repository.
+If you keep daily automations, hackathon scouts, notes, and new workflows inside one Antigravity Desktop folder such as `my-working-daily`, you can sync a single Telegram chat directly with that folder.
 
-How two-way folder sync works in practice:
+How folder sync works each day:
 
-1. **Start synced via `.env` or slash command**: Set `AGY_DEFAULT_FOLDER=my-working-daily` in `.env` for automatic first-message sync, or run `/folders` in Telegram to pick any folder from `$HOME/.gemini/config/projects/*.json` with a tap.
-2. **Matches your Desktop sidebar (`archived:true` hidden)**: `agy-tele` inspects `$HOME/.gemini/antigravity/annotations/*.pbtxt` so archived historical sessions stay out of `/folders` counts and `/threads` lists while active folder threads and sidebar renames show up accurately.
-3. **Streams all active and newly scheduled automations in that folder**: With `watchFolder` active, whenever any thread in `my-working-daily` finishes a turn (including twice-daily hackathon crons or newly spawned scheduled runs), Telegram delivers it prefixed with `[my-working-daily | Thread Title]` and an inline `[ Reply: Thread Title ]` button.
-4. **One-tap context switching and folder-scoped `/new`**: Tap `[ Reply: Thread Title ]` on any incoming notification to steer your next message directly to that automation thread while keeping the rest of the folder watched. Send `/new <prompt>` (or type freely when the folder has no active thread yet) and `agy-tele` sets `ANTIGRAVITY_PROJECT_ID=<folderId>` so the new Desktop conversation is created inside `my-working-daily`, making it easy to discuss, refine, and save workflows right back to Desktop.
-5. **Scoped listing and clean exit**: `/threads` automatically filters to the synced folder (use `/threads all [query]` to search across all folders), and `/folder off` detaches the folder watcher while keeping your current thread bound.
+1. **Sync from `.env` or Telegram**: Set `AGY_DEFAULT_FOLDER=my-working-daily` in `.env` for automatic sync on first message, or send `/folders` in Telegram to pick any folder from `$HOME/.gemini/config/projects/*.json`.
+2. **Matches your Desktop sidebar**: `agy-tele` reads `$HOME/.gemini/antigravity/annotations/*.pbtxt`, so archived threads (`archived:true`) stay hidden in `/folders` and `/threads`, while renamed or active threads appear just like on Desktop.
+3. **Watches every active and new automation in the folder**: With `watchFolder` on, whenever any thread in `my-working-daily` finishes a turn (including twice-daily cron runs or newly started tasks), Telegram shows `[my-working-daily | Thread Title]` with an inline `[ Reply: Thread Title ]` button.
+4. **One-tap switching and folder-scoped `/new`**: Tap `[ Reply: Thread Title ]` on any message to send your next reply straight to that thread while still watching the rest of the folder. Run `/new <prompt>` (or send plain text when the folder has no active thread yet) and `agy-tele` passes `ANTIGRAVITY_PROJECT_ID=<folderId>` so the new conversation saves right inside `my-working-daily` on Desktop.
+5. **Folder filtering and clean detach**: `/threads` shows only threads inside your synced folder by default (run `/threads all [query]` to search all folders), and `/folder off` stops watching the folder while keeping your current thread bound.
 
 Example daily flow in `my-working-daily`:
 
@@ -175,16 +175,16 @@ Bot:  Updated .agents/skills/hackathon-architect/SKILL.md and logged the change 
 
 ### Single DM Thread Switching
 
-If you prefer to chat one-on-one with a bot:
+If you want to manually switch between threads in direct chat:
 
-1. Run `/threads` to inspect your latest active threads across all workspaces, or `/threads <keyword>` to search titles and previews using SQLite `conversations_fts`.
-2. Tap an inline bind button or type `/bind <prefix>` (4 to 8 hex characters are usually unique; if ambiguous, `resolveConversationByPrefix` asks for more characters).
-3. Run `/tail 6` right after binding when you want to read the last 6 finalized Desktop turns without scrolling through the whole log.
-4. Run `/status` before walking away from your desk to confirm `agentapi: connected`, current cursor `step_index`, and active compose mode.
+1. Send `/threads` to list your recent threads, or `/threads <keyword>` to search titles and previews using SQLite `conversations_fts`.
+2. Tap an inline button or run `/bind <prefix>`. Four to eight hex characters are usually unique; if not, `resolveConversationByPrefix` asks for a longer prefix.
+3. Run `/tail 6` right after binding to read the last 6 finished Desktop turns without opening your Mac.
+4. Run `/status` before leaving your desk to confirm `agentapi: connected`, the current log step, and your compose mode.
 
 ### Answering Questions and Pulling Screenshots
 
-When Antigravity calls `ask_question` during a planning or execution turn, `AgyTeleDaemon` renders each question's choices as vertical inline buttons in Telegram:
+When Antigravity asks a multiple choice question (`ask_question`), `AgyTeleDaemon` sends the options as clickable buttons in Telegram:
 
 ```text
 [Question] Merge PR now?
@@ -195,12 +195,12 @@ Reply with an option for: Merge PR now?
 [ Hold         ]
 ```
 
-Tapping `[ Merge to dev ]` dispatches callback `q:<stepIndex>:<idx>`, resolves the exact original option string from memory, and sends `"Merge to dev"` into Antigravity Desktop immediately via `agentapi send-message`.
+Tapping `[ Merge to dev ]` looks up the exact option label from memory and sends `"Merge to dev"` to Antigravity Desktop right away through `agentapi send-message`.
 
-Visual proof goes in two directions:
+Images move in two ways:
 
-1. **Automatic attachment**: Whenever a `PLANNER_RESPONSE` mentions up to `2` local image paths (`file:///.../shot.png` or `/.../preview.webp`) that exist on disk (`.png`, `.jpg`, `.jpeg`, `.webp`), the daemon automatically uploads them via `sendPhoto`.
-2. **On-demand pull**: Send `/shot /Volumes/Dev/repo/artifacts/check.png` anytime to upload a local image file from the Mac to your phone.
+1. **Sent automatically**: When a model reply (`PLANNER_RESPONSE`) points to up to `2` existing local image files (`.png`, `.jpg`, `.jpeg`, `.webp`), the daemon uploads them to Telegram via `sendPhoto`.
+2. **Requested anytime**: Send `/shot /Volumes/Dev/repo/artifacts/check.png` from Telegram to upload a local screenshot from your Mac.
 
 ### Running 24/7 with macOS launchd
 
@@ -235,12 +235,12 @@ Mac 24/7 Reliability Tips:
 
 ## Composer Pipeline
 
-Fast phone messages often mix Vietnamese phrasing, Vietlish shorthand, ticket numbers, and file paths. Leaving raw mobile notes unedited wastes Desktop agent turns; blind translation corrupts code spans, repo slugs, and `@mentions`. `src/composer.ts` solves both problems in four deterministic stages:
+Quick phone messages often mix Vietnamese, Vietlish shorthand, ticket numbers, and file paths. Raw mobile notes waste agent turns, while blind translation breaks code spans, repo names, and `@mentions`. `src/composer.ts` handles both problems in four steps:
 
-1. **Mask (`maskProtectedTokens`)**: Replaces code blocks, links, URLs, paths, ticket keys, mentions, and kebab-case slugs with `ZXQTOK000X` placeholders.
-2. **Detect (`detectNeedsEnglishCompose`)**: Inspects only unmasked prose for Vietnamese diacritics, Vietlish shorthand (`khong`, `ko`, `dc`, `cham`, `nhan`, `giup`, `sua`, `loi`, `luon`, `nhe`, `xem`), prohibited dashes, or AI-slop verbs. Clean English passes through unchanged (`modeUsed: "raw"`, zero network calls).
-3. **Translate and Scrub (`googleTranslateGtx` + `scrubNoAiSlop`)**: Routes masked Vietnamese/Vietlish through Chinese pivot normalization (`auto -> zh-CN -> en`, `2500ms` timeout) or deterministic Unicode-aware offline normalization (`applyOfflineVietlishNormalization`), then converts dash bullets (`"- "`) to numbered lists, removes em-dashes and spaced hyphens, drops throat-clearing openers, and swaps slop words (`"utilize"` to `"use"`, `"streamline"` to `"simplify"`, `"seamlessly"` to `"smoothly"`).
-4. **Restore and Parity Check (`restoreProtectedTokens` + `checkSemanticDrift`)**: Restores every `ZXQTOK000X` token with whitespace padding if NMT removed surrounding spaces, then compares numeric literals, `[A-Z]{2,10}-\d+` ticket IDs, `@mentions`, and token presence against the original prompt. If any token was dropped or translated, it automatically reverts to offline normalization (`warnings` explains why).
+1. **Mask (`maskProtectedTokens`)**: Hides code blocks, links, URLs, file paths, ticket keys, mentions, and hyphenated slugs behind `ZXQTOK000X` placeholders.
+2. **Detect (`detectNeedsEnglishCompose`)**: Checks the remaining text for Vietnamese diacritics, Vietlish words (`khong`, `ko`, `dc`, `cham`, `nhan`, `giup`, `sua`, `loi`, `luon`, `nhe`, `xem`), banned dashes, or AI slop words. Clean English passes through with no network call (`modeUsed: "raw"`).
+3. **Translate and Scrub (`googleTranslateGtx` + `scrubNoAiSlop`)**: Translates masked Vietnamese or Vietlish through a Chinese pivot (`auto -> zh-CN -> en`, `2500ms` timeout) or falls back to local offline rules. Next, `scrubNoAiSlop` turns dash bullets into numbered items, removes em-dashes and spaced hyphens, drops filler openers, and swaps slop words (`"utilize"` to `"use"`, `"streamline"` to `"simplify"`, `"seamlessly"` to `"smoothly"`).
+4. **Restore and Check Parity (`restoreProtectedTokens` + `checkSemanticDrift`)**: Puts every `ZXQTOK000X` token back with clean spacing, then verifies that every number, `[A-Z]{2,10}-\d+` ticket key, and `@mention` matches the original note. If any protected item was dropped or altered, it falls back to safe offline normalization and notes the reason in `warnings`.
 
 ### Protected Token Classes (`maskProtectedTokens`)
 
@@ -285,11 +285,11 @@ bun run compose -- --mode always "ê check lại auth callback bên ai-video-mak
 
 ## Safety Gates and Loop Prevention
 
-1. **Fail-closed user allowlist**: `loadConfig(..., true)` refuses to boot `start` if `TELEGRAM_BOT_TOKEN` is blank/placeholder or `TELEGRAM_ALLOWED_USER_IDS` has zero valid numeric IDs. Every incoming `message` and `callback_query` checks `this.config.allowedUserIds.includes(userId)` before touching any command or disk state.
-2. **Zero open inbound ports**: `HttpTelegramClient` communicates exclusively over outbound HTTPS `getUpdates` long-polling (`25s` timeout) to `api.telegram.org`. No local HTTP server, ngrok tunnel, or webhook port is opened on your Mac.
-3. **`SYSTEM_SDK` echo suppression**: Whenever `agy-tele` calls `agentapi send-message`, Antigravity logs that injected prompt with `source: "SYSTEM_SDK"`. `parseStepToEvent` forwards only `USER_EXPLICIT` (`USER_INPUT`) and `MODEL` (`PLANNER_RESPONSE`) rows where `status === "DONE"`, preventing feedback loops completely.
-4. **Atomic state persistence and newline cursors**: `saveState` writes JSON to `${statePath}.${pid}.tmp` and renames it atomically so power loss never leaves half-written JSON. Transcript cursors advance strictly to the last `0x0a` newline byte, never splitting an in-flight JSONL line.
-5. **Markdown parse retry and message chunking**: `HttpTelegramClient.sendMessage` automatically retries without `parse_mode` if Telegram rejects malformed formatting, and `chunkTelegramText` splits replies over `3900` characters on newline or space boundaries below Telegram's `4096` character limit.
+1. **Strict user allowlist**: `loadConfig(..., true)` stops `start` right away if `TELEGRAM_BOT_TOKEN` is missing or `TELEGRAM_ALLOWED_USER_IDS` is empty. Every incoming `message` and `callback_query` checks `this.config.allowedUserIds.includes(userId)` before running any command.
+2. **Zero open ports**: `HttpTelegramClient` only makes outbound HTTPS `getUpdates` requests (`25s` timeout) to `api.telegram.org`. Your Mac never opens a webhook port or tunnel.
+3. **`SYSTEM_SDK` loop guard**: When `agy-tele` runs `agentapi send-message`, Antigravity saves that message with `source: "SYSTEM_SDK"`. `parseStepToEvent` ignores `SYSTEM_SDK` lines and only forwards completed `USER_EXPLICIT` (`USER_INPUT`) and `MODEL` (`PLANNER_RESPONSE`) turns.
+4. **Safe state saves and newline cursors**: `saveState` writes JSON to `${statePath}.${pid}.tmp` and renames it in one step so crashes never corrupt state. Log cursors move only to the last `0x0a` newline byte so half-written lines are never read early.
+5. **Markdown fallback and message splitting**: `HttpTelegramClient.sendMessage` retries as plain text if Telegram rejects Markdown formatting, and `chunkTelegramText` splits long replies at `3900` characters on clean line or word breaks.
 
 ## Telegram Commands
 
@@ -551,8 +551,8 @@ await daemon.start();
 
 ## Limitations
 
-1. Live Telegram Bot API long-polling (`getUpdates`) and file uploads (`sendPhoto`) require a real token from `@BotFather` in `.env`. Automated suite coverage exercises daemon routing against a typed mock `TelegramClient`.
-2. Outbound delivery streams finalized `DONE` steps from `transcript.jsonl` (typically within a second of step completion) rather than streaming token-by-token partial deltas mid-generation.
+1. Live Telegram polling (`getUpdates`) and photo uploads (`sendPhoto`) require a real token from `@BotFather` in `.env`. Automated tests verify daemon routing against a mock `TelegramClient`.
+2. Replies appear in Telegram once each `DONE` step finishes in `transcript.jsonl` (usually within one second) instead of streaming partial tokens while the model is still typing.
 
 ## License
 
